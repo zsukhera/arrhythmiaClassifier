@@ -1,6 +1,20 @@
 Here are my observations and notes: 
 MIT-BIH EDA 27-9-2026
 - what does a sample mean in our context ?
+ECG is an electrical signal that has been digitally sampled
+360 samples make up 1 second of ECG data
+sample 0       → 0 seconds
+sample 360     → 1 second
+sample 720     → 2 seconds
+sample 1800    → 5 seconds
 
+instead of plotting in samples, we can also plot in samples
 - data can also be held locally but can also be used from physionet itself, which is v nice.
+
+- what format gives us what?
+atr has expert annotations
+dat has ECG samples
+hea has metadeta -> signal length, channels, and sampling frequency etc
+
+
 

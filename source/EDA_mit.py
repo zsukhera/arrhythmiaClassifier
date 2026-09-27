@@ -44,6 +44,11 @@ print("Sampling frequency:", record.fs)
 print("Signal length:", record.sig_len)
 print("Channels:", record.sig_name)
 
+#printing all the information contained in the hea format
+print("Printing all the information contained in the hea format")
+header = wfdb.rdheader("../datasets/mitbih/mitdb/100")
+for key, value in vars(header).items():
+    print(f"{key}: {value}")
 # %%
 
 signal = record.p_signal
@@ -63,13 +68,19 @@ plt.ylabel("Amplitude")
 plt.show()
 
 # %%
-#ask gpt if this is also being imported from physionet or are we using local data
+#uncomment when you need to get annotations from physionet instead of making use of local data
+"""
 annotation = wfdb.rdann(
 RECORD,
 "atr",
 pn_dir="mitdb"
 )
-
+"""
+#local
+annotation = wfdb.rdann(
+    "../datasets/mitbih/mitdb/100",
+    "atr"
+)
 #number of annotations is of paramount importance to our ML model
 print("Number of annotations:", len(annotation.sample))
 print("First annotations:")
