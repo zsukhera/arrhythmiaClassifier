@@ -45,10 +45,16 @@ print("Signal length:", record.sig_len)
 print("Channels:", record.sig_name)
 
 #printing all the information contained in the hea format
+print()
+print("=======================================================")
 print("Printing all the information contained in the hea format")
 header = wfdb.rdheader("../datasets/mitbih/mitdb/100")
 for key, value in vars(header).items():
     print(f"{key}: {value}")
+
+print("=======================================================", end = '\n')
+print()
+
 # %%
 
 signal = record.p_signal

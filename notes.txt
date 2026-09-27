@@ -16,5 +16,93 @@ atr has expert annotations
 dat has ECG samples
 hea has metadeta -> signal length, channels, and sampling frequency etc
 
+- detailed description of what is contained in hea format
+the .hea file is a small plain text file (~5 lines). wfdb.rdheader() reads it and turns each value into an attribute.
+raw 100.hea:
+    100 2 360 650000
+    100.dat 212 200 11 1024 995 -22131 0 MLII
+    100.dat 212 200 11 1024 1011 20052 0 V5
+    # 69 M 1085 1629 x1
+    # Aldomet, Inderal
+line 1 = record line: name, number of signals, fs, sig_len
+each signal line = file, format, gain, resolution, adc zero, initial value, checksum, block size, lead name
+lines starting with # = comments
+
+record-level fields (whole recording):
+record_name  = 100 -> matches the file names 100.hea, 100.dat, 100.atr
+n_sig        = 2 -> number of channels
+fs           = 360 -> sampling frequency in Hz (360 samples per second per channel)
+sig_len      = 650000 -> samples per channel. 650000 / 360 ≈ 1805.6 s ≈ 30 minutes of ECG
+counter_freq = None -> optional second clock for converting sample numbers to an external time base, not used
+base_counter = None -> starting value of that counter, not used
+base_time    = None -> time of day recording started, left out (anonymity)
+base_date    = None -> date recording started, left out
+comments     = patient info:
+    '69 M 1085 1629 x1' -> 69 year old male. 1085 1629 x1 are old tape/recording reference codes, not relevant for analysis
+    'Aldomet, Inderal'  -> medications. Aldomet (methyldopa) treats high blood pressure.
+                           Inderal (propranolol) is a beta-blocker -> lowers heart rate and can change rhythm.
+                           keep this in mind when looking at heart rate features for this record
+
+signal arrays (all None with rdheader because it only reads the .hea, no samples):
+p_signal   -> physical signal in mV, float array of shape (sig_len, n_sig). filled when using rdrecord
+d_signal   -> digital signal, the raw integer ADC values stored in the .dat file
+e_p_signal, e_d_signal -> "expanded" versions, only used when channels have different sampling rates
+
+per-signal fields (one entry per channel -> [MLII, V5]):
+sig_name        = ['MLII', 'V5'] -> lead names. MLII = modified limb lead II, the main lead in almost every
+                  MIT-BIH record and the one usually used for beat classification. V5 = modified chest lead.
+                  the second channel changes between records (usually V1, sometimes V2, V4, V5)
+file_name       = ['100.dat', '100.dat'] -> both channels are in the same file, samples interleaved (ch0, ch1, ch0, ch1, ...)
+fmt             = ['212', '212'] -> storage format. 212 = two 12-bit samples packed into 3 bytes
+samps_per_frame = [1, 1] -> each channel is sampled at exactly fs (2 would mean twice the base rate)
+skew            = [None, None] -> time offset to align channels, None = already aligned
+byte_offset     = [None, None] -> bytes to skip at start of .dat before samples begin, None = start at byte 0
+adc_gain        = [200.0, 200.0] -> 200 digital units = 1 mV
+baseline        = [1024, 1024] -> digital value that corresponds to 0 mV
+units           = ['mV', 'mV'] -> physical units
+adc_res         = [11, 11] -> ADC resolution in bits. 2^11 = 2048 levels (0 to 2047)
+adc_zero        = [1024, 1024] -> digital value at the middle of the ADC range (same as baseline here, but not always)
+init_value      = [995, 1011] -> first sample's digital value per channel, used to check the file was read correctly
+checksum        = [-22131, 20052] -> 16-bit sum of all samples per channel, detects corrupted/truncated .dat files
+block_size      = [0, 0] -> 0 = data can be read as a plain continuous stream
+
+how gain, baseline and digital values fit together:
+physical (mV) = (digital - baseline) / adc_gain
+first MLII sample: (995 - 1024) / 200 = -0.145 mV
+first V5 sample:   (1011 - 1024) / 200 = -0.065 mV
+full range: 0 to 2047 -> about -5.12 mV to +5.12 mV
+rdrecord does this conversion to produce p_signal. wfdb.rdrecord(path, physical=False) gives the raw integers in d_signal instead.
+
+- how do the 2 channels combine to form a single file? can i access the channels separately?
+the samples are interleaved. the .dat file is one long stream of frames, each frame = one sample from each channel at the same moment:
+    frame 0: [MLII s0][V5 s0]
+    frame 1: [MLII s1][V5 s1]
+    ...
+    frame 649999
+format 212 -> each sample is 12 bits, so one frame (2 samples) = 24 bits = 3 bytes, packed like this:
+    byte 0: low 8 bits of MLII sample
+    byte 1: high 4 bits of V5 sample | high 4 bits of MLII sample
+    byte 2: low 8 bits of V5 sample
+check: 100.dat is 1,950,000 bytes = 650,000 frames x 3 bytes, no header or padding (that's why byte_offset = None)
+wfdb unpacks the bytes, splits them into columns and applies the gain/baseline conversion for us
+
+yes, channels can be accessed separately:
+1. slice the array (each column = one channel):
+    mlii = record.p_signal[:, 0]
+    v5   = record.p_signal[:, 1]
+    mlii = record.p_signal[:, record.sig_name.index("MLII")]   # by name, safer since channel order varies between records
+2. load only the channel you want:
+    rec = wfdb.rdrecord("../datasets/mitbih/mitdb/100", channels=[0])            # by index
+    rec = wfdb.rdrecord("../datasets/mitbih/mitdb/100", channel_names=["MLII"])  # by name (newer wfdb versions only)
+    rec.p_signal.shape -> (650000, 1)
+3. load only part of the recording:
+    rec = wfdb.rdrecord("../datasets/mitbih/mitdb/100", channels=[0], sampfrom=0, sampto=3600)  # first 10 s
+4. raw integers instead of mV:
+    rec = wfdb.rdrecord("../datasets/mitbih/mitdb/100", channels=[0], physical=False)
+    rec.d_signal -> the 12-bit values as stored in the file
+MLII is the lead to use -> present in nearly every MIT-BIH record, the second channel changes between records.
+so pick it by name (sig_name.index("MLII")) instead of hard-coding [:, 0]
 
 
+- here i will be adding the description of how CLARITY AI and previous papers 
+have been using these 2 channels and what our strategy will be. 
