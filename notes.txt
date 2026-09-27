@@ -1,0 +1,6 @@
+Here are my observations and notes: 
+MIT-BIH EDA 27-9-2026
+- what does a sample mean in our context ?
+
+- data can also be held locally but can also be used from physionet itself, which is v nice.
+
