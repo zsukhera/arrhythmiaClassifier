@@ -1,3 +1,8 @@
+How to activate the virtual environment?
+source .venv/bin/activate
+
+when you're done, run "deactivate"
+
 Here are my observations and notes: 
 MIT-BIH EDA 27-9-2026
 - what does a sample mean in our context ?
@@ -103,6 +108,80 @@ yes, channels can be accessed separately:
 MLII is the lead to use -> present in nearly every MIT-BIH record, the second channel changes between records.
 so pick it by name (sig_name.index("MLII")) instead of hard-coding [:, 0]
 
+
+28-08-2026
+- what is contained in the .atr
+the .atr holds the cardiologists' annotations: one label for every beat, plus some extra marks (rhythm changes, noise).
+it is a binary file. wfdb.rdann(path, "atr") reads it into an Annotation object, where every field is a list/array
+with one entry per annotation. record 100 has 2274 annotations.
+
+how it is stored on disk:
+a list of 16-bit words. in each word, top 6 bits = annotation type code, bottom 10 bits = samples since the previous annotation.
+    first word of 100.atr = 0x7012 -> code 28 ('+' rhythm change), 18 samples after the start
+the positions are stored as gaps, so rdann adds them up to get absolute sample numbers.
+a few special codes attach extra info to the previous annotation instead (e.g. code 63 = aux_note text follows)
+
+fields:
+record_name      = 100 -> which record the annotations belong to
+extension        = atr -> the file extension that was read (atr = the reference annotations made by the cardiologists)
+sample           = [18, 77, 370, 662, ...] -> where each annotation is, as a sample number.
+                   for beats it sits on the R peak (the tall spike). time in seconds = sample / fs, e.g. 77 / 360 = 0.214 s
+symbol           = ['+', 'N', 'N', ..., 'A', ...] -> the label. this is what the ML model will learn to predict
+subtype          = only 0 or 1 -> extra sub-classification. in record 100 only one annotation (the single V beat, at sample 546792)
+                   has subtype 1, the rest are 0. on noise marks ('~') it records which channels are noisy. can be ignored for beats
+chan             = always 0 -> the channel the annotation refers to. every annotation is attached to channel 0,
+                   it does not mean the beat is only visible on MLII
+num              = always 0 -> spare number field, not used in MIT-BIH
+aux_note         = ['(N\x00', '', '', ...] -> free text, almost always empty. on '+' annotations it holds the rhythm name.
+                   the \x00 at the end is a null byte left over from how the text is stored, strip it before using
+fs               = 360 -> sampling frequency, copied from the .hea so sample numbers can be turned into seconds
+label_store      = None -> the numeric type codes as stored in the file. not kept by rdann by default, symbol is used instead
+description      = None -> text meaning of each symbol, not filled by default.
+                    wfdb.io.annotation.ann_label_table has the full symbol -> description table
+custom_labels    = None -> for databases that define their own labels, MIT-BIH uses the standard ones
+contained_labels = None -> summary of which labels appear in the file, not filled by default
+ann_len          = 2274 -> number of annotations
+
+what is in record 100:
+    N: 2239 -> normal beat
+    A: 33   -> atrial premature contraction (a beat that starts early in the atria)
+    V: 1    -> premature ventricular contraction (an early beat starting in the ventricles)
+    +: 1    -> rhythm change, aux_note = '(N' at 0.05 s -> normal sinus rhythm for the whole recording
+not every annotation is a beat: 2274 annotations but 2273 beats, the '+' is not a heartbeat.
+other non-beat symbols across the database: '~' signal quality change, '|' isolated artifact, '"' comment, 'x' blocked P-wave,
+'[' and ']' start/end of ventricular flutter, '!' ventricular flutter wave. these must be filtered out before training.
+the classes are very imbalanced (2239 N vs 1 V here), which the model will have to deal with
+
+- what is contained in the .dat
+the .dat is the ECG itself: just the samples, no labels and no description of its own.
+without the .hea the bytes cannot be read (the header gives the format, number of channels, gain and baseline).
+layout and format 212 packing are described above (see the 2 channels question).
+
+what rdrecord gives back from it:
+d_signal = raw ADC integers exactly as stored, shape (650000, 2), dtype int64 -> rdrecord(path, physical=False)
+p_signal = the same samples converted to mV, shape (650000, 2), dtype float64 -> rdrecord(path), the default
+    first 5 frames, digital: [995, 1011] repeated
+    first 5 frames, mV:      [-0.145, -0.065] repeated
+    (digital - baseline) / adc_gain gives exactly p_signal for every sample -> confirmed True
+
+checks against the .hea, per channel:
+MLII:
+    init_value   = 995, .hea says 995 -> first sample matches
+    checksum     = -22131, .hea says -22131 -> file is complete, not corrupted
+    digital range = 481 to 1311 (ADC allows 0 to 2047) -> nowhere near the limits, so nothing was clipped
+    mV range     = -2.715 to 1.435
+    mean -0.306 mV, std 0.193 mV
+V5:
+    init_value   = 1011, .hea says 1011
+    checksum     = 20052, .hea says 20052
+    digital range = 531 to 1269 (ADC allows 0 to 2047) -> no clipping
+    mV range     = -2.465 to 1.225
+    mean -0.191 mV, std 0.148 mV
+
+observations:
+the mean is not 0 mV on either lead -> the signal sits below zero (a DC offset). ECGs also drift slowly over time
+(baseline wander from breathing and movement), both should be removed with filtering before feature extraction.
+checksum and init_value give a quick way to confirm every .dat file downloaded correctly.
 
 - here i will be adding the description of how CLARITY AI and previous papers 
 have been using these 2 channels and what our strategy will be. 
