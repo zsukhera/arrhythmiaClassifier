@@ -183,5 +183,90 @@ the mean is not 0 mV on either lead -> the signal sits below zero (a DC offset).
 (baseline wander from breathing and movement), both should be removed with filtering before feature extraction.
 checksum and init_value give a quick way to confirm every .dat file downloaded correctly.
 
-- here i will be adding the description of how CLARITY AI and previous papers 
-have been using these 2 channels and what our strategy will be. 
+
+29-09-2026
+MIT-BIH Arrhythmia is fundamentally a beat-level, annotated arrhythmia dataset, 
+whereas PTB-XL consists of 10-second, 12-lead clinical ECG records with potentially multiple diagnostic labels.
+These are the universal features present in both datasets. 
+| Feature       | MIT-BIH | PTB-XL |
+| ------------- | ------: | -----: |
+| Heart rate    |       ✓ |      ✓ |
+| RR mean       |       ✓ |      ✓ |
+| RR SD         |       ✓ |      ✓ |
+| QRS duration  |       ✓ |      ✓ |
+| QT            |       ✓ |      ✓ |
+| QTc           |       ✓ |      ✓ |
+| P amplitude   |       ✓ |      ✓ |
+| R amplitude   |       ✓ |      ✓ |
+| T amplitude   |       ✓ |      ✓ |
+| QRS area      |       ✓ |      ✓ |
+| QRS energy    |       ✓ |      ✓ |
+| T-wave energy |       ✓ |      ✓ |
+| Entropy       |       ✓ |      ✓ |
+| HRV features  |       ✓ |      ✓ |
+
+These are the features that requrie multiple beats:
+SDNN
+RMSSD
+pNN50
+Poincaré SD1
+Poincaré SD2
+sample entropy
+I have to decide what to use and how to go about it
+
+These are the channels present in PTB-XL:
+I
+II
+III
+aVR
+aVL
+aVF
+V1
+V2
+V3
+V4
+V5
+V6
+
+but MIT-BIH only has 2 channel ECG
+Option 1: use Lead II only
+
+
+
+## Dataset notes — EDA observations
+
+### MIT-BIH file formats
+
+- `.hea` — plain-text header: record name, number of signals, sampling frequency, signal length, per-channel gain/baseline/lead name.
+- `.dat` — raw ECG samples (format 212: two 12-bit samples packed into 3 bytes, channels interleaved frame-by-frame).
+- `.atr` — binary cardiologist annotations: one label per beat (R-peak sample position + symbol). Non-beat symbols (`+`, `~`, `|`, `"`, `x`, `[`, `]`, `!`) must be filtered before training.
+
+Key facts for record 100:
+- 2 channels: MLII and V5. MLII is the primary lead — present in nearly every MIT-BIH record; second channel varies (usually V1, V2, V4, V5) — **always pick MLII by name** (`sig_name.index("MLII")`), not hard-coded index 0.
+- 650,000 samples per channel ≈ 30 minutes. fs = 360 Hz.
+- Gain = 200 digital units/mV, baseline = 1024. mV range ≈ −5.12 to +5.12 mV.
+- Mean signal is not 0 mV (DC offset + baseline wander from breathing/movement) → **remove with filtering before feature extraction**.
+- Class imbalance is severe (record 100: 2239 N, 33 A, 1 V) — model must handle it.
+- Medications (e.g. Inderal/propranolol) affect heart rate and rhythm for specific records — relevant context when interpreting per-record anomalies.
+
+### MIT-BIH vs PTB-XL — key distinction
+
+MIT-BIH is a **beat-level annotated arrhythmia dataset** (2-channel, 360 Hz, beat labels).  
+PTB-XL is a **record-level clinical ECG dataset** (12-lead, 500 Hz, multilabel diagnostic superclasses).  
+**Label spaces are incompatible — never conflate PTB-XL diagnostic superclasses with MIT-BIH beat-level arrhythmia classes.**
+
+Universal features present in both datasets (for reference if cross-dataset work arises):
+heart rate, RR mean/SD, QRS duration, QT, QTc, P/R/T amplitudes, QRS area/energy, T-wave energy, entropy, HRV features.
+
+Features requiring multiple beats (HRV): SDNN, RMSSD, pNN50, Poincaré SD1/SD2, sample entropy.
+
+PTB-XL has 12 leads (I, II, III, aVR, aVL, aVF, V1–V6); MIT-BIH has 2.  
+**Current working decision: use Lead II only** when cross-dataset alignment is needed (Lead II is present in both).
+
+---
+
+## Development environment
+
+- Python virtual environment: activate with `source .venv/bin/activate`, deactivate with `deactivate`.
+- Key libraries (see `requirements.txt`): `wfdb` (MIT-BIH/PhysioNet reading), `numpy`, `pandas`, `scipy`, `matplotlib`.
+- Data can be loaded locally from downloaded PhysioNet files **or** streamed directly from PhysioNet via `wfdb` (both options are available).

@@ -1,0 +1,507 @@
+| Parameter            |                                      Recommended setting | Why                                                            |
+| -------------------- | -------------------------------------------------------: | -------------------------------------------------------------- |
+| ECG channels         |                                    1 primary ECG channel | Keep model/input simple                                        |
+| Acquisition rate     |                                              **500 SPS** | Native ADS1292 rate                                            |
+| Model rate           |                                               **360 Hz** | Match MIT-BIH                                                  |
+| PGA gain             |                                          **6** initially | Good starting point; verify against electrode signal amplitude |
+| Input                |                                         Differential ECG | Required for ECG measurement                                   |
+| Lead configuration   |                                   **Lead II-equivalent** | Closest practical target for MIT-BIH's MLII channel            |
+| RLD                  |                                              **Enabled** | Improves common-mode rejection                                 |
+| Lead-off detection   | Optional during development; disable for clean ML signal | Avoid injecting lead-off behavior into training signal         |
+| Respiration          |                                             **Disabled** | Not needed for arrhythmia classifier                           |
+| Internal test signal |                         Disabled during normal operation | Only use for hardware validation                               |
+| ADC resolution       |                                                   24-bit | Native ADS1292                                                 |
+| Digital interface    |                                                      SPI | Native interface                                               |
+| Filtering            |                          External/software preprocessing | Make identical to MIT-BIH preprocessing                        |
+| Output to model      |                                    360-Hz normalized ECG | Same representation as training                                |
+
+
+
+But there is a configuration issue with MIT-BIH and the sensor that we're using
+mitbih is at 360hz and the sensor is at 500 which cannot be tuned down exactly to 360hz
+             ADS1292
+                │
+             500 SPS
+                │
+                ▼
+       anti-alias / low-pass
+                │
+                ▼
+           resample
+                │
+                ▼
+             360 Hz
+                │
+                ▼
+          ECG classifier
+
+MIT-BIH was digitized at 11-bit resolution over a 10-mV range.
+ADS1292 gives you a 24-bit ADC.
+You don't need to deliberately throw away 13 bits.
+
+MIT-BIH gives you two-channel ECG waveforms sampled at 360 Hz, so a segment might look like two arrays of numbers
+this is the training data.
+
+lightgbm expects a feature matrix. cnn, lstm, and KAN will make use of raw numerical ECG sequence.
+
+MIT-BIH is more than suited for deep learning
+the standard model input is going to be 360hz
+ECG window is going to be experimented: 
+once with R peak. 1 second × 360 Hz = 360 samples/channel
+once with before and after R peak. 2 × 360 = 720 samples
+
+features for lightgbm 
+X_i =
+[
+ RR_prev,
+ RR_current,
+ RR_next,
+ mean_RR,
+ median_RR,
+ sd_RR,
+ min_RR,
+ max_RR,
+ RR_range,
+ RR_CV,
+
+ QRS_duration,
+ QRS_amplitude,
+ QRS_area,
+ QRS_energy,
+ QRS_max_slope,
+ QRS_min_slope,
+
+ R_amplitude,
+ R_prominence,
+ Q_amplitude,
+ S_amplitude,
+ R_S_ratio,
+ Q_R_ratio,
+
+ P_amplitude,
+ P_duration,
+ P_area,
+
+ T_amplitude,
+ T_duration,
+ T_area,
+ T_R_ratio,
+
+ PR,
+ QRS_duration,
+ QT,
+ QTc,
+ ST,
+
+ mean,
+ std,
+ RMS,
+ max,
+ min,
+ range,
+ skewness,
+ kurtosis
+]
+
+Extract features independently 
+Channel 1:
+R amplitude
+QRS duration
+QRS energy
+...
+
+Channel 2:
+R amplitude
+QRS duration
+QRS energy
+...
+then these two will be concatenated
+Feature vector = [features_channel1 | features_channel2]
+42 × 2 = 84 features
+But DL based models do not need these 84 features
+CNN receives:
+
+[Channel 1 raw ECG]
+[Channel 2 raw ECG]
+
+For example:
+
+X_CNN.shape = (N, 2, 720)
+
+LSTM:
+
+X_LSTM.shape = (N, 720, 2)
+
+KANformer:
+
+X_KANformer.shape = (N, 720, 2)
+
+The neural network learns things like:
+
+ECG waveform
+     ↓
+QRS morphology
+     ↓
+temporal relationships
+     ↓
+higher-level representation
+     ↓
+arrhythmia class
+
+You don't explicitly tell it:
+
+"This is the QRS duration."
+
+It learns useful representations from the waveform itself.
+
+
+                         MIT-BIH
+                            │
+                            ▼
+                 Common preprocessing
+                            │
+                            ▼
+                    Beat segmentation
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+              ▼                           ▼
+       Raw ECG waveform             Feature extraction
+              │                           │
+       ┌──────┼─────────┐                 │
+       │      │         │                 ▼
+       ▼      ▼         ▼             LightGBM
+      CNN    LSTM   KANformer
+       │      │         │
+       │      │         ▼
+       │      │       Teacher
+       │      │         │
+       │      │         ▼
+       │      │      Tiny CNN
+       │      │
+       └──────┴─────────────────────┐
+                                    ▼
+                         Compare performance
+                                    +
+                          deployment metrics
+
+LightGBM experiments
+
+Experiment 1
+LightGBM
+42 handcrafted features
+Experiment 2
+LightGBM
+84 features
+(two-channel features)
+Experiment 3
+
+Feature importance:
+
+LightGBM
+      ↓
+Feature importance
+      ↓
+Top 10 / 20 / 30 features
+
+This can tell you whether you really need 84 features.
+
+Guidlines regarding train_test_split
+Randomly select 80% of beats → training
+20% → testing
+
+because beats from the same patient/recording can end up in both sets.
+
+Instead:
+
+Patients / records
+       │
+       ├── Training
+       │
+       └── Testing
+
+
+MIT-BIH records
+       ↓
+Record/patient split
+       ↓
+Preprocessing
+       ↓
+Beat extraction
+       ↓
+Feature extraction
+       ↓
+Training/testing
+
+We will be using a 2 second window, but it is going to be kept as an experimental value. 
+
+
+///////////////////////////////////////////////////////////////
+Knowledge Distillation
+                         MIT-BIH
+                            │
+                            ▼
+                 Preprocessing
+                 2-channel ECG
+                            │
+                            ▼
+                     [2 × 720]
+                    2-sec window
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+              ▼                           ▼
+       KANformer Teacher            1D-CNN Student
+              │                           │
+              │                           │
+       Soft predictions             Hard predictions
+              │                           │
+              └──────────┬────────────────┘
+                         │
+                         ▼
+              Knowledge Distillation
+                         │
+                         ▼
+                  Final Tiny CNN
+                         │
+                         ▼
+                Quantization/Pruning
+                         │
+                         ▼
+                    ESP32 + ADS1292
+
+Your project can use **KANformer as the deep, high-capacity teacher** and **1D-CNN or LSTM as the lightweight
+ student**. First, train KANformer normally on the two-channel MIT-BIH ECG input (e.g., a 2-second, 720-sample 
+ window per channel) using the true 5-class arrhythmia labels. Then train a standalone 1D-CNN and LSTM as 
+ baselines. After that, freeze the trained KANformer and train the student using **knowledge distillation**, where 
+ the student learns from both the ground-truth labels and the teacher's soft probability outputs. This lets 
+ the teacher transfer information about class similarities and ECG representations that may not be captured by 
+ the hard labels alone. The main KD experiment would therefore be **KANformer → 1D-CNN**, with **KANformer → LSTM** 
+ as an optional second experiment.
+
+
+The resulting comparison gives each model a clear purpose: **LightGBM** provides a handcrafted-feature 
+baseline, **1D-CNN/LSTM** provide lightweight deep-learning baselines, **KANformer** acts as the high-capacity 
+teacher, and **KD-CNN/KD-LSTM** test whether the teacher's knowledge can be transferred into smaller models. 
+The most important comparison is not simply accuracy, but the trade-off between **Macro-F1/sensitivity and deployment
+ cost** such as parameters, RAM, flash, latency, and energy. The distilled CNN can then be further **quantized/pruned 
+ and deployed on an ESP32 with ADS1292**, followed by validation using ECG acquired from the actual hardware.
+
+FIGURE 1 — Overall Model Pipeline
+
+                         MIT-BIH ECG
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │   Preprocessing  │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    2-Channel ECG
+                       [2 × 720]
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              ▼              ▼
+          LightGBM         1D-CNN          LSTM
+        (baseline)       (baseline)      (baseline)
+              │              │              │
+              │              │              │
+              │              ▼              │
+              │         KANformer           │
+              │          Teacher            │
+              │              │              │
+              │              ▼              │
+              │       Knowledge             │
+              │       Distillation          │
+              │              │              │
+              │              ▼              │
+              │           KD-CNN            │
+              │                              │
+              └────────── Evaluation ────────┘
+
+
+FIGURE 2 — Knowledge Distillation
+
+                         ECG
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+                ▼                   ▼
+          ┌───────────┐       ┌───────────┐
+          │ KANformer │       │  1D-CNN   │
+          │  Teacher  │       │  Student  │
+          └─────┬─────┘       └─────┬─────┘
+                │                   │
+                ▼                   ▼
+          Teacher logits       Student logits
+                │                   │
+                └─────────┬─────────┘
+                          │
+                          ▼
+                 ┌─────────────────┐
+                 │   KD Loss       │
+                 │                 │
+                 │ CE + KL Loss    │
+                 └────────┬────────┘
+                          │
+                          ▼
+                    Update Student
+                    Freeze Teacher
+
+
+FIGURE 3 — What the Student Learns
+
+             Ground-Truth Label
+                    │
+                    ▼
+              Cross-Entropy
+                    │
+                    │
+                    ▼
+ECG ───────────►  Student
+                    ▲
+                    │
+              KD / KL Loss
+                    │
+                    │
+ECG ───────────► Teacher
+                    │
+                    ▼
+              Soft Predictions
+
+       Student learns from BOTH:
+       
+       1. True arrhythmia labels
+       2. Teacher's learned knowledge
+
+
+FIGURE 4 — Model Comparison
+
+                         ECG
+                          │
+        ┌─────────────────┼─────────────────┐
+        │                 │                 │
+        ▼                 ▼                 ▼
+   Handcrafted         Raw ECG           Raw ECG
+     Features             │                 │
+        │                 │                 │
+        ▼                 ▼                 ▼
+    LightGBM             1D-CNN            LSTM
+    Baseline            Baseline          Baseline
+                          │
+                          │
+                          ▼
+                      KANformer
+                       Teacher
+                          │
+                          ▼
+                    Knowledge
+                    Distillation
+                          │
+                    ┌─────┴─────┐
+                    ▼           ▼
+                  KD-CNN      KD-LSTM
+
+FIGURE 5 — Deployment Pipeline
+
+                  KANformer
+                  Teacher
+                     │
+                     ▼
+             Knowledge Distillation
+                     │
+                     ▼
+                  Tiny CNN
+                     │
+                     ▼
+                Quantization
+                     │
+                     ▼
+                 INT8 Model
+                     │
+                     ▼
+             ┌───────────────┐
+             │     ESP32     │
+             └───────┬───────┘
+                     │
+                     ▼
+                 ADS1292
+                     │
+                     ▼
+               Real ECG Signal
+                     │
+                     ▼
+             Arrhythmia Class
+
+FIGURE 6 — Final Experimental Structure
+
+ MIT-BIH
+    │
+    ▼
+ Patient-aware split
+    │
+    ▼
+ ECG preprocessing
+    │
+    ▼
+ 2-channel windows
+    │
+    ├───────────────┐
+    │               │
+    ▼               ▼
+LightGBM          Deep Models
+    │               │
+    │       ┌───────┼────────┐
+    │       │       │        │
+    │       ▼       ▼        ▼
+    │     1D-CNN   LSTM   KANformer
+    │                         │
+    │                         ▼
+    │                  Teacher Model
+    │                         │
+    │                         ▼
+    │                  Knowledge
+    │                  Distillation
+    │                         │
+    │                    ┌────┴────┐
+    │                    ▼         ▼
+    │                  KD-CNN   KD-LSTM
+    │                    │
+    │                    ▼
+    │                Quantization
+    │                    │
+    └────────────┬───────┘
+                 ▼
+        Performance + Edge
+           Evaluation
+                 │
+                 ▼
+       ADS1292 + ESP32
+
+FIGURE 7 — What You Ultimately Want to Demonstrate
+
+        High-Capacity Model
+             KANformer
+                 │
+                 │ Knowledge
+                 │ Distillation
+                 ▼
+        ┌───────────────────┐
+        │   Small Student   │
+        │      1D-CNN       │
+        └─────────┬─────────┘
+                  │
+          Similar performance
+                  │
+                  ▼
+        Much smaller model
+                  │
+          ┌───────┼────────┐
+          ▼       ▼        ▼
+         RAM    Latency   Energy
+          │       │        │
+          └───────┼────────┘
+                  ▼
+             Edge Device
+          ADS1292 + ESP32

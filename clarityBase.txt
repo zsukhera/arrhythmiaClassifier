@@ -1,0 +1,441 @@
+
+===============================================================================
+CLARITY-AI 2.0 -- MEDICAL PIPELINE: METHODS & RESULTS (IMPLEMENTATION REFERENCE)
+===============================================================================
+
+HOW TO USE THIS FILE
+--------------------
+I am building an ECG arrhythmia classifier for my FYP, re-implementing the
+medical / arrhythmia part of CLARITY-AI 2.0. The intrusion-detection /
+security part is OUT OF SCOPE.
+
+Environment:
+  - Python, wfdb
+  - MIT-BIH at ../datasets/mitbih/mitdb/
+  - virtualenv in .venv (source .venv/bin/activate)
+
+Treat this file as the spec. Flag anything I ask for that contradicts it or
+that depends on a detail the paper does not specify (see section 9).
+
+Paper:
+  Khalid, Hussain, Hussain & Alkhalifah,
+  "Lightweight and interpretable edge intelligence AI with intrusion detection
+  for trustworthy cardiac arrhythmia in medical IoT",
+  Scientific Reports 16:14843 (2026).
+  DOI: 10.1038/s41598-026-43578-6. Open access, CC BY 4.0.
+
+
+1. THE IDEA
+-----------
+- Each heartbeat becomes a 40-dim hand-engineered feature vector
+  (statistical + fiducial/clinical + wavelet + HRV/non-linear).
+- Classifier: LightGBM, tuned with Optuna, trained on SMOTE-balanced MIT-BIH.
+- SHAP explains each prediction. The top SHAP drivers go into a prompt and an
+  LLM writes a clinician-readable report.
+- Claim: near-1D-CNN accuracy, ~12x smaller and ~12x faster on an ESP32, and
+  explanations that cardiologists rated as trustworthy.
+
+
+2. PIPELINE (MEDICAL PART ONLY)
+-------------------------------
+  Raw ECG (MIT-BIH, 360 Hz)
+    -> 4th-order Butterworth band-pass 0.5-40 Hz
+    -> R-peak detection (Pan-Tompkins-based)
+    -> 256-sample beat window around each R-peak (100 before, 156 after)
+    -> 40 hybrid features per beat (+ recent RR-interval history)
+    -> [train only] SMOTE on minority classes
+    -> LightGBM (Optuna Bayesian search, objective = CV F1)
+    -> prediction + confidence
+    -> SHAP TreeExplainer -> top 3-5 features by |SHAP|
+    -> structured prompt -> LLM -> clinician report
+
+Stated deployment: the device extracts features; the cloud runs inference,
+SHAP and the LLM. (Contradiction: the ESP32 benchmark runs LightGBM ON the
+device. See 9.16.)
+
+
+3. DATA
+-------
+  Dataset            Patients  Beats              Leads  Role
+  -----------------  --------  -----------------  -----  -----------------------
+  MIT-BIH Arrhythmia       47  ~110,000               2  train + test (primary)
+  PTB-XL               18,885  ~2.9M (segmented)     12  zero-shot test only
+  Chapman-Shaoxing     10,646  ~1.1M (segmented)     12  zero-shot test only
+
+Leads:
+- PTB-XL and Chapman: Lead II only.
+- MIT-BIH: MLII is implied, never stated explicitly.
+
+Classes (5):
+- N (Normal), L (LBBB), R (RBBB), V (PVC), A (APC).
+- The paper calls this "AAMI 5-class", but these are MIT-BIH beat symbols,
+  not AAMI N/S/V/F/Q.
+
+Two tasks are reported:
+- 5-class beat classification: macro-F1 + per-class metrics.
+- Binary anomaly vs normal: metrics for the anomaly (positive) class.
+  Presumably anomaly = {L, R, V, A}, but this is not stated.
+
+
+4. PRE-PROCESSING & SEGMENTATION
+--------------------------------
+  Filter         Butterworth, order 4, band-pass 0.5-40 Hz
+                 (removes baseline wander + muscle noise)
+  R-peaks        Pan-Tompkins-based detector
+  Window         256 samples = 100 before R + 156 after R
+                 at 360 Hz: ~278 ms before + ~433 ms after = ~711 ms
+  Normalisation  not mentioned (not needed for tree models)
+
+
+5. THE 40-FEATURE HYBRID SET
+----------------------------
+The text groups the features as 6 + 13 + 12 + 9 = 40.
+The definition table splits them more finely:
+
+  Group                     N   Contents
+  ------------------------  --  ----------------------------------------------
+  A  Statistical             6  mean, std, peak-to-peak, skewness, kurtosis,
+     ("original" features)      RMS of the 256-sample beat
+  B1 Fiducial - intervals    5  RR-pre, RR-post, QRS duration (Q on -> S off),
+                                QT interval (Q -> T offset), P-wave duration
+  B2 Fiducial - morphology   8  T-wave amp, P-wave amp, R/S ratio, P/R ratio,
+                                other amplitudes/ratios (only partly named)
+  C  Wavelet (DWT)          12  4-level DWT, db4; energy (sum cD^2) and
+                                Shannon entropy of cD1..cD4
+  D1 HRV (time & freq)       5  SDNN, RMSSD, LF/HF, ... over recent RR window
+  D2 Non-linear              4  Poincare SD1, SD2, Sample Entropy, ...
+
+Formulas given in the paper:
+- RR_pre  = t_R(i) - t_R(i-1)   [ms]
+- RR_post = t_R(i+1) - t_R(i)   [ms]
+  RR_pre vs RR_post captures the PVC compensatory pause.
+- QRS_dur = t_S - t_Q   [ms]
+  > 120 ms = "wide QRS" (PVC / bundle branch block).
+- T_amp = x(t_Tpeak)
+  negative = inverted T.
+- SD1 = sqrt(0.5 * Var(RR_i - RR_{i-1}))
+- SD2 = sqrt(0.5 * Var(RR_i + RR_{i-1}))   (as printed; see 9.11)
+- SampEn(m, r, N) = -ln(A/B)   (m, r, N not given)
+
+Algorithm 1: input = beat segment S + the patient's recent RR history R_hist.
+Compute the 4 groups, concatenate into V (40,). No per-patient tuning.
+
+
+6. MODEL & TRAINING
+-------------------
+- Classifier: LightGBM.
+- Imbalance: SMOTE on the TRAINING set only (oversamples L, R, V, A).
+- Tuning: Optuna (Bayesian), objective = cross-validated F1. The final model is
+  refit on all resampled training data.
+
+  Param             Range        Final
+  ----------------  -----------  -----
+  n_estimators      500-2000     1450
+  max_depth         5-15         11
+  learning_rate     0.01-0.2     0.05
+  num_leaves        20-50        38
+  subsample         0.6-1.0      0.85
+  colsample_bytree  0.6-1.0      0.75
+
+Not given: number of Optuna trials, number of CV folds, split method, seeds,
+class weights, early stopping.
+
+Baselines:
+- 1D-CNN (architecture not described) on the same beat segments, deployed as
+  TFLite.
+- "Original" CLARITY-AI: GradientBoostingClassifier on the 6 statistical
+  features.
+
+
+7. EXPLAINABILITY: SHAP + LLM
+-----------------------------
+Global:
+- mean |SHAP| over the test set (beeswarm plot).
+
+Local:
+- per-beat waterfall plot.
+
+Prompt (deterministic). It contains:
+  (1) predicted label + confidence
+  (2) SHAP base value
+  (3) top-K features (K = 3-5) ranked by |SHAP|, each as
+      {name, measured value, SHAP value, direction +/-}
+
+Required LLM output order:
+  decision -> ranked drivers -> short clinical interpretation
+           -> caution/limitations
+
+Grounding rule: use ONLY the supplied evidence; no extra diagnoses.
+LLM used: not named.
+
+Case studies:
+  PVC    -> ANOMALY, 92% confidence
+            QRS 162 ms (wide), T-amp -0.19 mV (inverted), + one more feature
+  Normal -> NORMAL, 98% confidence
+            QRS 84 ms, RR 780 ms (stable), T-amp +0.41 mV
+
+
+8. RESULTS
+----------
+
+8.1 MIT-BIH binary anomaly detection
+
+  Model                               Acc    Prec   Rec    F1     AUC
+  ----------------------------------  -----  -----  -----  -----  -----
+  CLARITY-AI original (GBC, 6 feats)  0.982  0.858  0.825  0.841  0.966
+  Random Forest                       0.850  0.820  0.800  0.850  0.850
+  1D-CNN (their benchmark)            0.985  0.930  0.935  0.932  0.982
+  YOLOv8 spectrogram (reported SOTA)  0.995  0.992  0.994  0.993  0.992
+  CLARITY-AI 2.0                      0.989  0.931  0.925  0.928  0.985
+
+  The YOLOv8 row is the value reported in the literature; they did not re-run
+  it.
+
+8.2 Ablation: adding feature groups (LightGBM, same hyperparameters)
+
+  Config               #feats(printed)  Acc    AnomRec  AnomF1  AUC
+  -------------------  ---------------  -----  -------  ------  -----
+  A1 Statistical                     6  0.985  0.862    0.860   0.971
+  A2 + Fiducial                     20  0.987  0.905    0.901   0.979
+  A3 + Wavelet                      32  0.988  0.919    0.921   0.983
+  A4 + HRV/Non-linear               40  0.989  0.925    0.928   0.985
+
+  - Fiducial features give the largest single jump (+0.041 F1).
+  - From A1 to A4, F1 improves 7.9% relative.
+
+8.3 Model x feature-set synergy (anomaly F1)
+
+                        Statistical(6)  Hybrid(40)
+  GBC (original model)  0.841           0.912
+  LightGBM              0.860           0.928
+
+  The feature set matters far more than the model swap.
+
+8.4 5-class per-class results (MIT-BIH)
+
+  Class     F1 1D-CNN  F1 CLARITY-2.0  Recall CLARITY-2.0
+  --------  ---------  --------------  ------------------
+  N         0.990      0.992           0.995
+  L (LBBB)  0.891      0.915           0.920
+  R (RBBB)  0.902      0.921           0.925
+  V (PVC)   0.945      0.938           0.930
+  A (APC)   0.910      0.918           0.915
+
+  - Macro-F1 is not printed; computed from the table, it is ~0.937.
+  - Largest confusion: APC -> PVC at 6.4%. Both are premature beats, and an
+    aberrant APC looks like a PVC.
+
+8.5 Zero-shot cross-dataset (trained on MIT-BIH only), anomaly F1
+
+  Model           MIT-BIH  PTB-XL  Chapman
+  --------------  -------  ------  -------
+  CLARITY-AI 2.0  0.928    0.885   0.861
+  1D-CNN          0.932    0.891   0.855
+
+  - CLARITY-AI 2.0 AUCs: MIT-BIH 0.985, PTB-XL 0.940, Chapman 0.915.
+  - The authors attribute the F1 drop to threshold/calibration mismatch, since
+    AUC stays high.
+
+  PTB-XL multi-label superclasses:
+
+  Class  F1 1D-CNN  F1 CLARITY  AUC CLARITY
+  -----  ---------  ----------  -----------
+  NORM   0.910      0.905       0.965
+  MI     0.855      0.849       0.940
+  STTC   0.801      0.795       0.910
+  CD     0.860      0.855       0.942
+  HYP    0.812      0.805       0.915
+
+8.6 On-device (ESP32, 520 KB SRAM)
+
+  Metric              1D-CNN (TFLite)    CLARITY-AI 2.0  Ratio
+  ------------------  -----------------  --------------  -------------
+  Model size          4.2 MB             350 KB          ~12x smaller
+  Peak RAM            1.1 MB (no fit)    120 KB          ~9.4x lower
+  Inference / beat    95.2 ms            8.1 ms          ~11.7x faster
+  Energy / inference  1100 uJ            95 uJ           ~11.5x lower
+
+  Measurement method:
+  - Latency: model call only, high-resolution timer, W warm-up runs, mean
+    over N runs.
+  - Energy: inline power monitor, E = integral(V*I dt) / N.
+  - Feature extraction time is NOT included.
+
+8.7 Global SHAP: top 10 features (mean |SHAP|)
+
+  Rank  Feature            Mean|SHAP|  Group
+  ----  -----------------  ----------  -----------
+   1    QRS Duration       0.452       Fiducial
+   2    RR-Interval (Post) 0.389       Fiducial
+   3    T-Wave Amplitude   0.291       Fiducial
+   4    Poincare SD1       0.255       Non-linear
+   5    DWT Energy cD1     0.201       Wavelet
+   6    RR-Interval (Pre)  0.187       Fiducial
+   7    Peak-to-peak       0.165       Statistical
+   8    P-Wave Amplitude   0.120       Fiducial
+   9    STD                0.098       Statistical
+  10    LF/HF              0.076       HRV
+
+  - QRS > 120 ms pushes toward anomaly; QRS < 100 ms pushes toward normal.
+  - Low or inverted T pushes toward anomaly.
+
+8.8 Clinician survey (N = 12 cardiologists, 5-pt Likert, % agree)
+
+  Statement                            Agree         95% CI (exact binomial)
+  -----------------------------------  ------------  -----------------------
+  Normal-beat explanation plausible    91.7% (11/12) -
+  Anomalous-beat explanation clear     83.3% (10/12) 51.6-97.9%
+  SHAP report increases trust          91.7% (11/12) 61.5-99.8%
+  Provides new clinical insight        58.3% (7/12)  -
+  Comfortable as diagnostic aid        75.0% (9/12)  42.8-94.5%
+
+  The authors call this formative feedback, not clinical validation.
+
+
+9. GAPS, INCONSISTENCIES & DECISIONS I MUST MAKE
+------------------------------------------------
+Each of these needs an explicit, documented choice in my implementation.
+
+9.1  TRAIN/TEST SPLIT NOT DESCRIBED
+     The paper never says random beat-level (intra-patient) vs inter-patient
+     DS1/DS2 (de Chazal 2004). Random beat splits leak patient identity and
+     inflate scores.
+     DECISION: random stratified split to replicate + inter-patient DS1/DS2
+     as the honest number.
+
+9.2  SMOTE BEFORE CV
+     Algorithm 2 resamples first, then runs CV. Synthetic samples leak into
+     the validation folds.
+     DECISION: SMOTE inside an imblearn.pipeline.Pipeline, applied per fold.
+
+9.3  "AAMI 5-CLASS" IS MISLABELLED
+     The classes are N/L/R/V/A. In AAMI, L and R belong to class N.
+     DECISION: follow N/L/R/V/A; optionally also report AAMI N/S/V/F/Q.
+
+9.4  WHICH BEATS / RECORDS
+     Other beat types (/ f F j E J e a S Q) and the paced records
+     102, 104, 107, 217 are not addressed.
+     DECISION: keep only N, L, R, V, A; exclude the paced records. Drop the
+     non-beat symbols (+ ~ | " x [ ] !).
+
+9.5  LABEL <-> DETECTED PEAK MATCHING
+     Pan-Tompkins peaks vs .atr annotation samples; tolerance not given.
+     DECISION: centre windows on the annotated samples, OR match detected
+     peaks within ~+/-50 ms. Document which.
+
+9.6  LEAD FOR MIT-BIH
+     Not stated; MLII is implied.
+     DECISION: MLII, selected by name (sig_name.index("MLII")).
+
+9.7  FEATURE COUNTS DON'T ADD UP
+     - DWT: 4 levels x {energy, entropy} = 8, but the paper claims 12.
+     - HRV/non-linear: the text says 3 + 6, the table says 5 + 4.
+     - Ablation: A2 = 20 and A3 = 32, but 6+13 = 19 and 19+12 = 31.
+     - The fiducial "remaining 10" are only partly named.
+     DECISION: define my own exact 40-feature list and document it.
+
+9.8  FIDUCIAL DELINEATION METHOD UNSPECIFIED
+     How P, Q, S, T onsets/offsets and peaks are found is not given.
+     Candidate: neurokit2.ecg_delineate (dwt or peak method).
+
+9.9  HRV WINDOW LENGTH NOT GIVEN
+     LF/HF normally needs ~2-5 min of RR data.
+     DECISION: choose the window (last N beats or last X s). Note that RR_post
+     makes the system non-causal by 1 beat.
+
+9.10 SAMPEN PARAMETERS NOT GIVEN
+     Typical: m = 2, r = 0.2 * SD.
+
+9.11 SD2 FORMULA AS PRINTED IS NON-STANDARD
+     Standard: SD2^2 = 2*SDNN^2 - 0.5*SD(dRR)^2.
+     Check against neurokit2 hrv_nonlinear.
+
+9.12 FILTER PHASE UNSPECIFIED
+     Use sosfiltfilt offline; a causal filter is needed on-device.
+
+9.13 LIGHTGBM SUBSAMPLE
+     subsample only works if subsample_freq (bagging_freq) > 0.
+     Not given; set it to 1.
+
+9.14 BINARY TASK DEFINITION UNCLEAR
+     Separate binary model, or the 5-class model collapsed to N vs non-N?
+
+9.15 CROSS-DATASET PROTOCOL UNCLEAR
+     - PTB-XL / Chapman are 500 Hz with record-level labels; resampling and
+       beat labelling are not described.
+     - The PTB-XL superclass table (NORM/MI/STTC/CD/HYP) cannot come from a
+       zero-shot N/L/R/V/A model.
+     DECISION: treat as optional/secondary; design my own protocol.
+
+9.16 EDGE/CLOUD CONTRADICTION
+     The architecture says cloud inference; the benchmark uses on-device
+     inference. The LightGBM-to-C export tool is not given, and
+     feature-extraction timing is not reported.
+
+9.17 NOT DESCRIBED
+     1D-CNN architecture, and which LLM was used.
+
+
+10. IMPLEMENTATION PLAN
+-----------------------
+(My choices; library suggestions are mine, not the paper's.)
+
+ 1. LOAD
+    wfdb.rdrecord(path, channel_names=["MLII"])
+    wfdb.rdann(path, "atr")
+    fs = 360
+ 2. FILTER
+    sos = scipy.signal.butter(4, [0.5, 40], btype="band", fs=360, output="sos")
+    then scipy.signal.sosfiltfilt
+ 3. R-PEAKS
+    Use the annotation samples for labels. Optionally run
+    neurokit2.ecg_peaks(method="pantompkins1985") to evaluate a
+    detection-based pipeline.
+ 4. SEGMENT
+    x[r-100 : r+156]; skip beats too close to record edges; keep N/L/R/V/A.
+ 5. FEATURES (40)
+    - statistical: numpy / scipy.stats
+    - fiducial: neurokit2 delineation
+    - DWT: pywt.wavedec(beat, "db4", level=4)
+    - HRV / non-linear: neurokit2 or antropy (SampEn) over a fixed RR window
+ 6. SPLIT
+    random stratified (replicate) + inter-patient DS1/DS2 (honest).
+ 7. TRAIN
+    imblearn Pipeline(SMOTE -> LGBMClassifier); Optuna over the ranges in
+    section 6; scoring = macro-F1, stratified 5-fold CV. Compare against the
+    paper's final hyperparameters.
+ 8. EVALUATE
+    acc, precision, recall, F1 (anomaly class + macro), ROC-AUC, confusion
+    matrix, ablation A1 -> A4, synergy check vs GBC.
+ 9. EXPLAIN
+    shap.TreeExplainer (multiclass: one SHAP array per class) -> beeswarm +
+    waterfall -> top-K prompt -> LLM report in the section 7 structure.
+10. EDGE (OPTIONAL)
+    export LightGBM to C (emlearn / m2cgen); measure size, RAM and latency on
+    an ESP32.
+
+
+11. LINKS TO MY MIT-BIH EDA SO FAR
+----------------------------------
+- fs = 360 Hz, so 256 samples = ~0.71 s. Records are 650,000 samples
+  (~30 min).
+- MLII is in almost every record; the 2nd channel varies (V1/V2/V4/V5).
+  Select MLII by name.
+- DC offset + baseline wander (record 100 MLII mean ~ -0.31 mV). The
+  0.5-40 Hz band-pass handles this.
+- .atr contains non-beat annotations (e.g. '+' with aux_note '(N') that must
+  be dropped.
+- Extreme class imbalance (record 100: 2239 N, 33 A, 1 V).
+- Medication (record 100 on propranolol, a beta-blocker) can shift RR/HRV
+  features. Keep in mind when reading HRV SHAP values.
+- Open item: how CLARITY-AI and prior papers use the two channels.
+  CLARITY-AI appears to use a SINGLE lead (MLII / Lead II) and ignores the
+  2nd MIT-BIH channel.
+
+===============================================================================
+Source: https://www.nature.com/articles/s41598-026-43578-6
+PDF:    https://www.nature.com/articles/s41598-026-43578-6.pdf
+===============================================================================
+
+
+
