@@ -270,3 +270,7 @@ PTB-XL has 12 leads (I, II, III, aVR, aVL, aVF, V1–V6); MIT-BIH has 2.
 - Python virtual environment: activate with `source .venv/bin/activate`, deactivate with `deactivate`.
 - Key libraries (see `requirements.txt`): `wfdb` (MIT-BIH/PhysioNet reading), `numpy`, `pandas`, `scipy`, `matplotlib`.
 - Data can be loaded locally from downloaded PhysioNet files **or** streamed directly from PhysioNet via `wfdb` (both options are available).
+
+
+- WINDOW SIZE AND type
+the clarity base paper makes no mention of their window. we will need to experiment with both the number of beats and the number of seconds

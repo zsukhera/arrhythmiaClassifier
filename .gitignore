@@ -100,3 +100,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Project level files
+clarityBase.txt
+GenericCodingGuidelines.txt
+SKILL.md
+STACK_1_(2).md

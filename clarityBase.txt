@@ -7,7 +7,7 @@ HOW TO USE THIS FILE
 --------------------
 I am building an ECG arrhythmia classifier for my FYP, re-implementing the
 medical / arrhythmia part of CLARITY-AI 2.0. The intrusion-detection /
-security part is OUT OF SCOPE.
+security part is OUT OF MY SCOPE.
 
 Environment:
   - Python, wfdb
@@ -46,13 +46,12 @@ Paper:
     -> [train only] SMOTE on minority classes
     -> LightGBM (Optuna Bayesian search, objective = CV F1)
     -> prediction + confidence
-    -> SHAP TreeExplainer -> top 3-5 features by |SHAP|
-    -> structured prompt -> LLM -> clinician report
+    -> SHAP TreeExplainer -> top 3-5 features by |SHAP|   //we will not be doing this
+    -> structured prompt -> LLM -> clinician report       //we will not be doing this
 
 Stated deployment: the device extracts features; the cloud runs inference,
 SHAP and the LLM. (Contradiction: the ESP32 benchmark runs LightGBM ON the
 device. See 9.16.)
-
 
 3. DATA
 -------
@@ -61,7 +60,10 @@ device. See 9.16.)
   MIT-BIH Arrhythmia       47  ~110,000               2  train + test (primary)
   PTB-XL               18,885  ~2.9M (segmented)     12  zero-shot test only
   Chapman-Shaoxing     10,646  ~1.1M (segmented)     12  zero-shot test only
-
+/*
+A zero-shot test (or zero-shot evaluation/learning task) is an artificial intelligence evaluation where a
+model is asked to perform a task or classify data it has never been explicitly trained or given examples for
+*/
 Leads:
 - PTB-XL and Chapman: Lead II only.
 - MIT-BIH: MLII is implied, never stated explicitly.
@@ -146,7 +148,7 @@ Baselines:
 - "Original" CLARITY-AI: GradientBoostingClassifier on the 6 statistical
   features.
 
-
+//beyond the scope of my fyp
 7. EXPLAINABILITY: SHAP + LLM
 -----------------------------
 Global:
@@ -261,6 +263,7 @@ Case studies:
   - Energy: inline power monitor, E = integral(V*I dt) / N.
   - Feature extraction time is NOT included.
 
+//skipping shap
 8.7 Global SHAP: top 10 features (mean |SHAP|)
 
   Rank  Feature            Mean|SHAP|  Group
