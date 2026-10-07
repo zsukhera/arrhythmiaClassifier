@@ -1,7 +1,6 @@
 How to activate the virtual environment?
 source .venv/bin/activate
 
-
 when you're done, run "deactivate"
 
 Here are my observations and notes: 
