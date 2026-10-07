@@ -274,3 +274,1002 @@ PTB-XL has 12 leads (I, II, III, aVR, aVL, aVF, V1–V6); MIT-BIH has 2.
 
 - WINDOW SIZE AND type
 the clarity base paper makes no mention of their window. we will need to experiment with both the number of beats and the number of seconds
+
+02-10-2026
+Hasan Adil's observations
+
+                        -------------------------- TASK : MIT-BIH dataset and how the two channels are used: -------------------------------
+
+list of all the papers that make use of the MIT-BIH dataset:
+1) Liu, Cheng & Lin (2013) — genuine two-lead Lead II + V1 portable ECG classification.
+2) Yang et al. (2019), DL-CCANet/TL-CCANet — explicit multi-lead feature fusion using MITDB.
+3) A Fast Machine Learning Model for ECG-Based Heartbeat Classification and Arrhythmia Detection (2019) — useful for understanding single-lead/lead-wise processing and conventional ML.
+4) Deep convolutional neural networks based ECG beats classification (2021) — explicitly uses MLII only.
+5) Pacing ECG Detection with Memory-Based Autoencoder (2021) — clearly documents the two-channel structure and why MLII is selected.
+6) A Tiny Matched Filter-Based CNN (2022) — particularly relevant to your edge/TinyDL direction; uses raw MLII for classification.
+7) Efficient Lightweight Multimodel Deep Fusion (2022) — explicitly chooses MLII to reduce system complexity.
+8) Hybrid CNN-LSTM for ECG-based arrhythmia detection in IoMT (2025) — particularly relevant to your MIoT context and explicitly selects 40 II+V1 recordings.
+9) Lightweight Deep Learning Architecture for Multi-Lead ECG Arrhythmia Detection (2025) — useful recent discussion of the single-lead versus multi-lead trade-off.
+
+
+After looking at how these papers have used the two channels from the MITBIH dataset, this is what I found:
+
+1) Option 1: Use only one channel, MLII:
+
+This is what majority of the papers did, mostly recent papers are implementing this strategy. The reasons are:
+MLII is available across essentially all recordings.
+It gives a clear QRS morphology.
+It simplifies preprocessing.
+It makes the input consistent.
+It reduces model size/computation.
+A lot of existing benchmark literature is based on single-lead classification.
+
+This is also the simplest implemention for our fyp. This way we only have one stream to deal with which is consistent across MITDB. Anotjer advantage is
+it will take low RAM and easier ESP32 deployment. Also, by using this we'll have strongest comparison with existing single lead literature.
+
+
+2) Option 2: A naive two channel fusion
+
+Test MLII and V1 with 1D CNN and then classifier. Looks simple, but we can only use recordings for which we have the lead configuration we want.
+For example, we can use only MLII and V1, and not treat MLII and V5 as MLII and V1.
+But, one channel can complement the other.
+
+
+3) Option 3: Two branch fusion
+
+Instead of simply stacking channels, we can fuse the features of MLII and V1 and then classify. The advantage is that the network can learn 
+MLII morphology and V1 morphology independently before learning how they relate. But, it increases parameters, activations and inference cost.
+A paper did this, but it was a sophisticated multi-lead fusion, and might be unnecessary for our fyp. But, this paper 
+demonstrated that genuinely exploiting the correlation between the two leads is possible.
+
+4) Option 4: What GPT suggested
+
+Since, we are using knowledge distillation, we can potentially make the following architecture:
+
+Teacher:
+MLII ──┐
+       ├── multi-lead CNN/Transformer ──> teacher
+V1 ───┘
+
+Student:
+MLII ──> Tiny 1D CNN ──> student
+
+Then,
+                  Teacher
+                /         \
+             MLII          V1
+                \         /
+                 rich features
+                      ↓
+                Knowledge
+                Distillation
+                      ↓
+                   Student
+                      ↑
+                    MLII
+
+As the teacher can exploit the extra information from the second lead while the final ESP32 model does not necessarily have to process both leads.
+
+A recommended experimental matrix that GPT also suggested is:
+Model	    Input	       Purpose
+Teacher	   MLII + V1   High-capacity multi-lead reference
+Student-1	MLII	   No-KD lightweight baseline
+Student-2	MLII	   KD from multi-lead teacher
+Student-3	MLII	   KD + INT8
+Optional	MLII + V1  Two-channel lightweight student
+
+Then compare:
+
+Teacher
+   ↓
+No-KD Student
+   ↓
+KD Student
+   ↓
+KD + INT8 Student
+
+using your planned metrics:
+
+Macro-F1
+Balanced accuracy
+per-class recall
+latency
+peak RAM
+flash/model size
+energy
+
+That aligns very naturally with the evaluation framework you've already been developing.
+This way, the ESP32 doesn't has to take both streams, through knowledge distillation, the student can work on the edge device, while the teacher step
+can be a preliminary step
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+                                     ----------------------- TASK: Evaluation Metrics of the Models -------------------------
+
+
+A) CONVENTIONAL ML/DL:
+
+----MIT-BIH---
+
+1) MIT-BIH Benchmark papers:
+The older MIT-BIH literature demonstrates why accuracy alone is a poor benchmark.
+| Study                      | Dataset | Model                    | Classes | Accuracy | Sensitivity | Specificity |     F1 |
+| -------------------------- | ------- | ------------------------ | ------: | -------: | ----------: | ----------: | -----: |
+| Luo et al. (2017)          | MIT-BIH | DNN-SDA                  |       4 |   98.80% |      71.40% |      99.80% |      — |
+| Majumdar & Ward (2017)     | MIT-BIH | SVM-RBF                  |       4 |   97.00% |     100.00% |      90.12% |      — |
+| Zhang et al. (2017)        | MIT-BIH | RNN                      |       5 |   99.40% |      97.60% |      99.70% |      — |
+| Xia et al. (2017)          | MIT-BIH | CNN                      |       3 |   98.63% |      98.79% |      97.87% |      — |
+| Jun et al. (2018)          | MIT-BIH | 2D-CNN                   |       4 |   99.05% |      99.57% |      97.85% |      — |
+| Yildirim (2018)            | MIT-BIH | BiLSTM                   |       4 |   99.39% |      95.66% |      98.11% |      — |
+| Sannino & De Pietro (2018) | MIT-BIH | DNN                      |       4 |   99.68% |      99.48% |      99.83% |      — |
+| Faust et al. (2018)        | MIT-BIH | BiLSTM                   |       5 |   98.51% |      98.32% |      98.67% | 98.00% |
+| Xia & Xie (2019)           | MIT-BIH | 1D-CNN + active learning |       4 |   99.20% |      95.73% |      98.73% |      — |
+| Chen et al. (2020)         | MIT-BIH | CNN-LSTM                 |       4 |   99.32% |      97.50% |      98.70% |      — |
+| Sharma et al. (2021)       | MIT-BIH | SVM + FFBPNN             |       5 |   98.53% |      98.24% |      95.68% |      — |
+| Ojha et al. (2022)         | MIT-BIH | CNN-SVM                  |       4 |   99.53% |      98.24% |      97.58% |      — |
+| Midani et al. (2023)       | MIT-BIH | CNN + BiLSTM             |       5 |   99.46% |      97.01% |      99.57% | 97.63% |
+
+2) MIT-BIH CNN + BiLSTM:
+Another detailed study on the five classes has:
+| Class       |   Accuracy | Sensitivity |        PPV |         F1 |
+| ----------- | ---------: | ----------: | ---------: | ---------: |
+| N           |     98.55% |      98.86% |     99.39% |     99.12% |
+| S           |     99.04% |      86.69% |     77.99% |     82.11% |
+| V           |     99.51% |      96.75% |     95.89% |     96.32% |
+| F           |     99.71% |      87.04% |     77.05% |     81.74% |
+| Q           |     99.85% |      99.00% |     98.94% |     98.97% |
+| **Average** | **99.33%** |  **93.67%** | **89.85%** | **91.65%** |
+
+this is a particularly useful benchmark, because it reveals something hidden by the 99% accuracies:
+minority-class sensitivity and F1 can be considerably lower.
+
+3) Classical ML Benchmark:
+a recent mit-bih comaprsion gives us :
+| Model                |   Accuracy | Precision |    Recall |        F1 |
+| -------------------- | ---------: | --------: | --------: | --------: |
+| Gaussian Naive Bayes |      67.0% |     67.4% |     67.0% |     66.8% |
+| Logistic Regression  |     67.42% |     67.4% |     68.0% |     67.4% |
+| Decision Tree        |      94.4% |     94.4% |     94.2% |     94.4% |
+| Linear SVM           |      94.4% |     94.4% |     94.2% |     94.4% |
+| SVM                  |     96.18% |     96.4% |     96.2% |     96.0% |
+| KNN                  |     97.22% |     97.4% |     97.2% |     97.2% |
+| Random Forest        |     98.24% |     98.4% |     98.2% |     98.2% |
+| LDCNN                | **99.38%** | **99.6%** | **99.4%** | **99.6%** |
+
+This gives us a useful conventional ML baseline, but the exact preprocessing/class split needs 
+to be kept alongside the numbers when we reproduce it.
+
+-----PTB-XL-----
+
+A recent PTB-XL comparison gives us:
+| Model       |       AUC | Accuracy |        F1 | Precision | Recall | Parameters |
+| ----------- | --------: | -------: | --------: | --------: | -----: | ---------: |
+| ResNet34-1D |     0.908 |    0.882 |     0.726 |     0.778 |  0.691 |     16.60M |
+| ResNet34-2D |     0.911 |    0.879 |     0.714 |     0.722 |  0.706 |     21.28M |
+| DNN-Zhu     |     0.918 |    0.890 |     0.762 |     0.758 |  0.774 |      3.68M |
+| DSE-ResNet  |     0.827 |    0.784 |     0.626 |     0.568 |  0.697 |      3.40M |
+| SE-ResNet1  |     0.889 |    0.862 |     0.653 |     0.753 |  0.599 |     58.15M |
+| SE-ResNet12 |     0.923 |    0.880 |     0.725 |     0.772 |  0.694 |     58.15M |
+| LightX3ECG  |     0.920 |    0.884 |     0.719 |     0.795 |  0.681 |      5.45M |
+| MS-LTCAF    | **0.927** |    0.877 | **0.745** | **0.806** |  0.692 |     24.59M |
+
+Another ptb-xl study gives us a simialr benchmark
+| Model        | Accuracy |   AUC | Recall | Precision |    F1 |
+| ------------ | -------: | ----: | -----: | --------: | ----: |
+| XResNet1D101 |    88.5% | 0.929 |  70.5% |     78.0% | 74.1% |
+| FCN-Wang     |    88.0% | 0.926 |  78.6% |     72.9% | 75.6% |
+| LSTM         |    87.6% | 0.927 |  80.0% |     70.6% | 75.0% |
+| ResNet-Wang  |    87.7% | 0.749 |  79.5% |     71.2% | 75.1% |
+| Inception1D  |    87.6% | 0.926 |  78.8% |     71.1% | 74.8% |
+| ECG-DNN      |    88.4% | 0.924 |  68.4% |     79.3% | 73.4% |
+| DNN-Zhu      |    89.0% | 0.918 |  77.4% |     75.8% | 76.6% |
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+B) KNOWLEDGE DISTILLATION:
+
+There is considerably less work combining ECG classification and KD than there is for conventional ECG classification.
+And, by restricting the datasets to MIT-BIH and PTB-XL only, that number becomes even smaller.
+
+------PTB-XL------
+
+1) Cross-Lead KD
+a recent paper achieved the following KD retention
+| Metric     | Teacher | KD Student |              Retention |
+| ---------- | ------: | ---------: | ---------------------: |
+| Accuracy   |  86.76% |     80.54% |                      — |
+| Macro-F1   |  86.63% |     80.36% |              **92.8%** |
+| AUC-ROC    |  94.04% |     89.10% |              **94.7%** |
+| Parameters | 793,733 |      6,417 | **123.7× compression** |
+
+This 2026 study used
+Teacher: 12-lead InceptionTime-Transformer
+Student: single-lead Lead II DSConv
+on PTB-XL.
+
+2) HMT-KD on PTB-XL:
+A 2026 hierarchical multi-teacher KD study used PTB-XL on the follwing construct
+
+ResNet18 + SENet
+        +
+MobileNetV2
+        ↓
+Teacher Assistant
+        ↓
+Lightweight Student
+
+The student reportedly achieved 85.45% accuracy, 96.53% AUROC and >100× parameter reduction on PTB-XL.
+This is useful as a KD benchmark, although its architecture is substantially more complicated than what we likely want for ESP32.
+
+-----MIT-BIH-----
+
+1) KD Literature:
+There's a 2026 study distilling ECGFounder into compact students using MIT-BIH Arrhythmia and PTB-XL.
+It evaluates ECGFounder teacher, ResNet-1D student, lightweight CNN-1D student and a quantum-ready student
+For MIT-BIH, the reported teacher has:
+Recall ≈ 0.990
+F1 ≈ 0.840
+and the distilled students remain in approximately the 0.93–0.98 recall range.
+GPT doesn't recommend using this as a primary numerical benchmark yet because the task formulation and reported metrics differ substantially 
+from the standard five-class MIT-BIH AAMI benchmark.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+C) TINY ML/DL WITHOUT KD:
+
+------MIT-BIH------
+
+1) TinyML 1D-CNN on MIT-BIH:
+A 2026 TinyML feasibility study deployed a quantized 1D-CNN on an Arduino UNO.
+
+Task:
+3 classes:
+Normal
+Ventricular
+Supraventricular
+
+Results:
+Accuracy: 97.6%
+Sensitivity: 97.6%
+Memory footprint: <24 KB
+Inference time: ~200 ms/heartbeat
+
+This is an extremely useful TinyML benchmark, but it is a 3 class problem, not the intended 5-class AAMI problem.
+The authors themselves explicitly acknowledge that they simplified the classification task to make ultra-low-cost deployment feasible.
+
+2) TinyML five-class MIT-BIH:
+A 2024 IEEE TinyML study used a quantized deep-learning model for five-class ECG rhythm classification on MIT-BIH.
+They reported:
+Accuracy ≈ 97.34%
+F1 ≈ 0.96
+Model size: 143 KB
+Real-time microcontroller operation
+
+The model used extracted P/R/S wave features together with a two-input deep-learning architecture.
+This is much closer to the intended problem because it uses all five classes.
+
+3) RNN on STM32:
+A 2022 study evaluated RNN architectures on MIT-BIH and then ported them to an STM32 platform.
+The basic RNN had approximately:
+5k parameters
+~117 KB storage
+~150 ms inference
+
+while the LSTM variant achieved approximately 90% accuracy.
+This study is valuable because it explicitly evaluates resource usage on a microcontroller, rather than simply saying that the model is lightweight.
+
+4) FPGA SNN — MIT-BIH:
+Xing et al. developed a spiking neural network with channel-wise attention for five MIT-BIH heartbeat classes.
+They reported:
+Accuracy: 98.26%
+Sensitivity: 94.75%
+F1: 89.09%
+Latency: 1.37 ms/beat
+Energy: 346.33 μJ/beat
+
+but, under an inter-patient evaluation:
+Accuracy: 92.07%
+
+This is particularly useful because it demonstrates how dramatically the evaluation protocol can affect the apparent accuracy.
+
+5) FPGA 1D-CNN — MIT-BIH:
+A configurable FPGA inference engine tested two CNN models on MIT-BIH:
+| Model             | Accuracy | Energy/inference |
+| ----------------- | -------: | ---------------: |
+| Lightweight CNN   |    98.9% |          2.05 μJ |
+| High-accuracy CNN |    99.3% |         14.27 μJ |
+
+This demonstrates that 'Tiny' doesn't always mean highest accuracy with the smallest network.
+There's a measurable accuracy–energy–model-size trade-off.
+
+6) EdgeECG — MIT-BIH:
+A very recent 2026 edge-oriented model.
+EdgeECG uses compact CNN, dual-criterion pruning, quantization and STM32F103 deployment.
+The results were as follows:
+| Metric                                                |       Result |
+| ----------------------------------------------------- | -----------: |
+| Accuracy, standard evaluation                         |   **98.07%** |
+| Accuracy, patient-independent record-level evaluation |   **80.73%** |
+| Parameters                                            |    **2,680** |
+| Non-zero parameter reduction                          |         ~50% |
+| Inference latency                                     |  **0.025 s** |
+| Energy/inference                                      | **0.156 mJ** |
+| MCU                                                   |    STM32F103 |
+| SRAM                                                  |        64 KB |
+
+GPT suggests that this is one of the most important TinyDL benchmark for us.
+It highlights the huge difference between accuracy under the standard benchmark vs. patient independent evaluation.
+So, that is exactly why it strongly recommends that our FYP report both conventional benchmark results and a patient-independent test.
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+D) THE INTERSECTION: KD + TINYDL:
+
+1) PTB-XL — Cross-lead KD + Tiny student:
+The 2026 Edge–Cloud Collaborative ECG-Assisted Diagnostic System is the closest published architecture to this.
+Teacher: 12 lead PTB-XL --> InceptionTime --> Transformer
+Student: Lead-II only --> Depthwise-separable CNN --> binary classifier
+KD: Teacher --> soft labels + hard labels + auxiliary multi-label supervision --> Student
+
+The student contains only 6,417 parameters. The authors then quantize it to INT8 and test it under Cortex-M4 simulation.
+Below are the results:
+| Model            |   Accuracy |   Macro-F1 |        AUC |
+| ---------------- | ---------: | ---------: | ---------: |
+| Teacher          |     86.76% |     86.63% |     94.04% |
+| Student + KD     | **80.54%** | **80.36%** | **89.10%** |
+| TinyCNN          |     80.16% |     79.99% |     88.50% |
+| TinyResNet       |     80.39% |     80.21% |     88.71% |
+| Student, no KD   |     80.33% |     80.16% |     88.49% |
+| **Student + KD** | **80.54%** | **80.31%** | **89.06%** |
+
+According to GPT, the important result is that KD gives the tiny student a small accuracy/F1 improvement but a clearer improvement in AUC.
+The same study also reports the following hardware numbers:
+| Resource                    |   Teacher |   KD Student |
+| --------------------------- | --------: | -----------: |
+| Parameters                  |   793,733 |    **6,417** |
+| FP32 weight size            | ~3,101 KB | **~25.1 KB** |
+| INT8 weights                |         — |  **~6.3 KB** |
+| TFLite file                 |         — |  **20.8 KB** |
+| GPU latency                 |   2.46 ms |      0.38 ms |
+| Cortex-M4 simulated latency |         — |  **11.6 ms** |
+| Peak SRAM                   |         — |    **63 KB** |
+| Compression                 |        1× |   **123.7×** |
+
+This looks a good benchmark for the ESP32 feasibility.
+But an important limitation is that the Cortex-M4 result was obtained using QEMU simulation, not physical hardware. 
+The authors explicitly say physical MCU validation is still required.
+So we shouldn't present the 11.6 ms as a proven physical-device latency.
+
+A summary of all the task is:
+| Group              | Dataset        |                               Typical performance | Main metric         | Resource reporting           |
+| ------------------ | -------------- | ------------------------------------------------: | ------------------- | ---------------------------- |
+| Conventional ML/DL | MIT-BIH        |                                ~97–99.7% accuracy | Acc, Se, Sp, F1     | Usually poor                 |
+| Conventional DL    | PTB-XL         |                     ~0.88–0.93 AUC; ~0.72–0.77 F1 | Macro-AUC, Macro-F1 | Sometimes params             |
+| KD                 | MIT-BIH/PTB-XL | Generally retains substantial teacher performance | Acc/F1/AUC          | Parameters/compression       |
+| TinyML/TinyDL      | MIT-BIH        |                     ~90–99% depending on protocol | Acc, Se, F1         | **Latency/RAM/Flash/energy** |
+| KD + TinyDL        | PTB-XL         |             ~80.5% Acc, 80.3% Macro-F1, 0.891 AUC | Macro-F1/AUC        | **Excellent**                |
+| KD + TinyDL        | MIT-BIH        |                        Literature is much thinner | —                   | Major research gap           |
+
+GPT says there's a real literature gap here.
+After restricting the search to MIT-BIH and PTB-XL, the literature separates quite cleanly:
+                    ECG ARRHYTHMIA
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+   High accuracy                     Low-resource
+   conventional DL                  TinyML/TinyDL
+        │                                 │
+        │                                 │
+   MIT-BIH/PTB-XL                    MIT-BIH/PTB-XL
+        │                                 │
+        └──────────────┬──────────────────┘
+                       │
+                 KNOWLEDGE
+                 DISTILLATION
+                       │
+                       ↓
+               KD + TinyDL
+
+There are many papers in the top-left and bottom-right.
+But MIT-BIH-specific KD → TinyDL arrhythmia classification remains much less developed.
+The 2026 PTB-XL paper is also evidence that this direction is an emerging one.
+
+Finally, GPT recommends developing the following benchmark.
+
+
+-----------MIT-BIH Benchmark---------
+
+Classification:
+Do classification with the standard five AAMI superclasses
+N  = Normal
+S  = Supraventricular ectopic
+V  = Ventricular ectopic
+F  = Fusion
+Q  = Unknown
+
+Report:
+
+Primary:
+Macro-F1
+Balanced Accuracy
+
+Secondary:
+Accuracy
+Macro Precision
+Macro Recall
+Per-class Recall
+Per-class F1
+Confusion Matrix
+
+Deployment:
+Number of parameters
+Flash/model size
+Peak RAM
+MACs
+Inference latency
+Energy/inference
+
+
+-----------------PTB-XL Benchmark---------------
+
+Primary:
+Macro-AUROC
+Macro-F1
+
+Secondary:
+Accuracy
+Macro precision
+Macro recall
+per-class F1
+per-class AUROC
+AUPRC if available
+
+Deployment:
+parameters
+Flash
+RAM
+MACs
+latency
+energy
+
+
+
+Below I am also sharing some things from GPT which u might find useful:
+
+The most useful benchmark numbers for your proposal
+
+If I reduce the literature to the numbers I think your supervisor/committee will care about most:
+
+MIT-BIH conventional DL
+99.7% accuracy / 99.3% F1 — hierarchical DL.
+
+MIT-BIH CNN-BiLSTM
+99.33% accuracy / 91.65% average F1 / 93.67% sensitivity.
+
+MIT-BIH TinyML
+97.34% accuracy / F1 ≈ 0.96 / 143 KB — five-class quantized TinyML system.
+
+MIT-BIH TinyML, more constrained
+97.6% accuracy / <24 KB / 200 ms — but only three classes.
+
+MIT-BIH extreme TinyDL
+98.07% standard accuracy / 80.73% patient-independent accuracy / 2,680 parameters / 25 ms — EdgeECG.
+
+PTB-XL conventional DL
+0.927 Macro-AUC / 0.745 F1 — MS-LTCAF.
+
+PTB-XL KD + TinyDL
+80.54% accuracy / 80.36% Macro-F1 / 0.891 AUC / 6,417 parameters / 123.7× compression.
+
+PTB-XL KD + MCU simulation
+20.8 KB INT8 TFLite / 63 KB SRAM / 11.6 ms simulated Cortex-M4 latency.
+
+
+One more important point: MIT-BIH's published 99%+ numbers are often intra-patient/beat-level results, 
+whereas patient-independent evaluation can fall dramatically. The recent literature explicitly identifies patient leakage/split 
+strategy as a major reason for inflated MIT-BIH performance.
+
+So for your benchmark, I would make patient-independent evaluation + Macro-F1 + per-class recall + deployment cost mandatory. 
+That will make your eventual comparison much more credible than simply chasing the highest published accuracy.
+
+
+
+Hasan's notes 
+
+                        -------------------------- TASK : MIT-BIH dataset and how the two channels are used: -------------------------------
+
+list of all the papers that make use of the MIT-BIH dataset:
+1) Liu, Cheng & Lin (2013) — genuine two-lead Lead II + V1 portable ECG classification.
+2) Yang et al. (2019), DL-CCANet/TL-CCANet — explicit multi-lead feature fusion using MITDB.
+3) A Fast Machine Learning Model for ECG-Based Heartbeat Classification and Arrhythmia Detection (2019) — useful for understanding single-lead/lead-wise processing and conventional ML.
+4) Deep convolutional neural networks based ECG beats classification (2021) — explicitly uses MLII only.
+5) Pacing ECG Detection with Memory-Based Autoencoder (2021) — clearly documents the two-channel structure and why MLII is selected.
+6) A Tiny Matched Filter-Based CNN (2022) — particularly relevant to your edge/TinyDL direction; uses raw MLII for classification.
+7) Efficient Lightweight Multimodel Deep Fusion (2022) — explicitly chooses MLII to reduce system complexity.
+8) Hybrid CNN-LSTM for ECG-based arrhythmia detection in IoMT (2025) — particularly relevant to your MIoT context and explicitly selects 40 II+V1 recordings.
+9) Lightweight Deep Learning Architecture for Multi-Lead ECG Arrhythmia Detection (2025) — useful recent discussion of the single-lead versus multi-lead trade-off.
+
+
+After looking at how these papers have used the two channels from the MITBIH dataset, this is what I found:
+
+1) Option 1: Use only one channel, MLII:
+
+This is what majority of the papers did, mostly recent papers are implementing this strategy. The reasons are:
+MLII is available across essentially all recordings.
+It gives a clear QRS morphology.
+It simplifies preprocessing.
+It makes the input consistent.
+It reduces model size/computation.
+A lot of existing benchmark literature is based on single-lead classification.
+
+This is also the simplest implemention for our fyp. This way we only have one stream to deal with which is consistent across MITDB. Anotjer advantage is
+it will take low RAM and easier ESP32 deployment. Also, by using this we'll have strongest comparison with existing single lead literature.
+
+
+2) Option 2: A naive two channel fusion
+
+Test MLII and V1 with 1D CNN and then classifier. Looks simple, but we can only use recordings for which we have the lead configuration we want.
+For example, we can use only MLII and V1, and not treat MLII and V5 as MLII and V1.
+But, one channel can complement the other.
+
+
+3) Option 3: Two branch fusion
+
+Instead of simply stacking channels, we can fuse the features of MLII and V1 and then classify. The advantage is that the network can learn 
+MLII morphology and V1 morphology independently before learning how they relate. But, it increases parameters, activations and inference cost.
+A paper did this, but it was a sophisticated multi-lead fusion, and might be unnecessary for our fyp. But, this paper 
+demonstrated that genuinely exploiting the correlation between the two leads is possible.
+
+4) Option 4: What GPT suggested
+
+Since, we are using knowledge distillation, we can potentially make the following architecture:
+
+Teacher:
+MLII ──┐
+       ├── multi-lead CNN/Transformer ──> teacher
+V1 ───┘
+
+Student:
+MLII ──> Tiny 1D CNN ──> student
+
+Then,
+                  Teacher
+                /         \
+             MLII          V1
+                \         /
+                 rich features
+                      ↓
+                Knowledge
+                Distillation
+                      ↓
+                   Student
+                      ↑
+                    MLII
+
+As the teacher can exploit the extra information from the second lead while the final ESP32 model does not necessarily have to process both leads.
+
+A recommended experimental matrix that GPT also suggested is:
+Model	    Input	       Purpose
+Teacher	   MLII + V1   High-capacity multi-lead reference
+Student-1	MLII	   No-KD lightweight baseline
+Student-2	MLII	   KD from multi-lead teacher
+Student-3	MLII	   KD + INT8
+Optional	MLII + V1  Two-channel lightweight student
+
+Then compare:
+
+Teacher
+   ↓
+No-KD Student
+   ↓
+KD Student
+   ↓
+KD + INT8 Student
+
+using your planned metrics:
+
+Macro-F1
+Balanced accuracy
+per-class recall
+latency
+peak RAM
+flash/model size
+energy
+
+That aligns very naturally with the evaluation framework you've already been developing.
+This way, the ESP32 doesn't has to take both streams, through knowledge distillation, the student can work on the edge device, while the teacher step
+can be a preliminary step
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+                                     ----------------------- TASK: Evaluation Metrics of the Models -------------------------
+
+
+A) CONVENTIONAL ML/DL:
+
+----MIT-BIH---
+
+1) MIT-BIH Benchmark papers:
+The older MIT-BIH literature demonstrates why accuracy alone is a poor benchmark.
+| Study                      | Dataset | Model                    | Classes | Accuracy | Sensitivity | Specificity |     F1 |
+| -------------------------- | ------- | ------------------------ | ------: | -------: | ----------: | ----------: | -----: |
+| Luo et al. (2017)          | MIT-BIH | DNN-SDA                  |       4 |   98.80% |      71.40% |      99.80% |      — |
+| Majumdar & Ward (2017)     | MIT-BIH | SVM-RBF                  |       4 |   97.00% |     100.00% |      90.12% |      — |
+| Zhang et al. (2017)        | MIT-BIH | RNN                      |       5 |   99.40% |      97.60% |      99.70% |      — |
+| Xia et al. (2017)          | MIT-BIH | CNN                      |       3 |   98.63% |      98.79% |      97.87% |      — |
+| Jun et al. (2018)          | MIT-BIH | 2D-CNN                   |       4 |   99.05% |      99.57% |      97.85% |      — |
+| Yildirim (2018)            | MIT-BIH | BiLSTM                   |       4 |   99.39% |      95.66% |      98.11% |      — |
+| Sannino & De Pietro (2018) | MIT-BIH | DNN                      |       4 |   99.68% |      99.48% |      99.83% |      — |
+| Faust et al. (2018)        | MIT-BIH | BiLSTM                   |       5 |   98.51% |      98.32% |      98.67% | 98.00% |
+| Xia & Xie (2019)           | MIT-BIH | 1D-CNN + active learning |       4 |   99.20% |      95.73% |      98.73% |      — |
+| Chen et al. (2020)         | MIT-BIH | CNN-LSTM                 |       4 |   99.32% |      97.50% |      98.70% |      — |
+| Sharma et al. (2021)       | MIT-BIH | SVM + FFBPNN             |       5 |   98.53% |      98.24% |      95.68% |      — |
+| Ojha et al. (2022)         | MIT-BIH | CNN-SVM                  |       4 |   99.53% |      98.24% |      97.58% |      — |
+| Midani et al. (2023)       | MIT-BIH | CNN + BiLSTM             |       5 |   99.46% |      97.01% |      99.57% | 97.63% |
+
+2) MIT-BIH CNN + BiLSTM:
+Another detailed study on the five classes has:
+| Class       |   Accuracy | Sensitivity |        PPV |         F1 |
+| ----------- | ---------: | ----------: | ---------: | ---------: |
+| N           |     98.55% |      98.86% |     99.39% |     99.12% |
+| S           |     99.04% |      86.69% |     77.99% |     82.11% |
+| V           |     99.51% |      96.75% |     95.89% |     96.32% |
+| F           |     99.71% |      87.04% |     77.05% |     81.74% |
+| Q           |     99.85% |      99.00% |     98.94% |     98.97% |
+| **Average** | **99.33%** |  **93.67%** | **89.85%** | **91.65%** |
+
+this is a particularly useful benchmark, because it reveals something hidden by the 99% accuracies:
+minority-class sensitivity and F1 can be considerably lower.
+
+3) Classical ML Benchmark:
+a recent mit-bih comaprsion gives us :
+| Model                |   Accuracy | Precision |    Recall |        F1 |
+| -------------------- | ---------: | --------: | --------: | --------: |
+| Gaussian Naive Bayes |      67.0% |     67.4% |     67.0% |     66.8% |
+| Logistic Regression  |     67.42% |     67.4% |     68.0% |     67.4% |
+| Decision Tree        |      94.4% |     94.4% |     94.2% |     94.4% |
+| Linear SVM           |      94.4% |     94.4% |     94.2% |     94.4% |
+| SVM                  |     96.18% |     96.4% |     96.2% |     96.0% |
+| KNN                  |     97.22% |     97.4% |     97.2% |     97.2% |
+| Random Forest        |     98.24% |     98.4% |     98.2% |     98.2% |
+| LDCNN                | **99.38%** | **99.6%** | **99.4%** | **99.6%** |
+
+This gives us a useful conventional ML baseline, but the exact preprocessing/class split needs 
+to be kept alongside the numbers when we reproduce it.
+
+-----PTB-XL-----
+
+A recent PTB-XL comparison gives us:
+| Model       |       AUC | Accuracy |        F1 | Precision | Recall | Parameters |
+| ----------- | --------: | -------: | --------: | --------: | -----: | ---------: |
+| ResNet34-1D |     0.908 |    0.882 |     0.726 |     0.778 |  0.691 |     16.60M |
+| ResNet34-2D |     0.911 |    0.879 |     0.714 |     0.722 |  0.706 |     21.28M |
+| DNN-Zhu     |     0.918 |    0.890 |     0.762 |     0.758 |  0.774 |      3.68M |
+| DSE-ResNet  |     0.827 |    0.784 |     0.626 |     0.568 |  0.697 |      3.40M |
+| SE-ResNet1  |     0.889 |    0.862 |     0.653 |     0.753 |  0.599 |     58.15M |
+| SE-ResNet12 |     0.923 |    0.880 |     0.725 |     0.772 |  0.694 |     58.15M |
+| LightX3ECG  |     0.920 |    0.884 |     0.719 |     0.795 |  0.681 |      5.45M |
+| MS-LTCAF    | **0.927** |    0.877 | **0.745** | **0.806** |  0.692 |     24.59M |
+
+Another ptb-xl study gives us a simialr benchmark
+| Model        | Accuracy |   AUC | Recall | Precision |    F1 |
+| ------------ | -------: | ----: | -----: | --------: | ----: |
+| XResNet1D101 |    88.5% | 0.929 |  70.5% |     78.0% | 74.1% |
+| FCN-Wang     |    88.0% | 0.926 |  78.6% |     72.9% | 75.6% |
+| LSTM         |    87.6% | 0.927 |  80.0% |     70.6% | 75.0% |
+| ResNet-Wang  |    87.7% | 0.749 |  79.5% |     71.2% | 75.1% |
+| Inception1D  |    87.6% | 0.926 |  78.8% |     71.1% | 74.8% |
+| ECG-DNN      |    88.4% | 0.924 |  68.4% |     79.3% | 73.4% |
+| DNN-Zhu      |    89.0% | 0.918 |  77.4% |     75.8% | 76.6% |
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+B) KNOWLEDGE DISTILLATION:
+
+There is considerably less work combining ECG classification and KD than there is for conventional ECG classification.
+And, by restricting the datasets to MIT-BIH and PTB-XL only, that number becomes even smaller.
+
+------PTB-XL------
+
+1) Cross-Lead KD
+a recent paper achieved the following KD retention
+| Metric     | Teacher | KD Student |              Retention |
+| ---------- | ------: | ---------: | ---------------------: |
+| Accuracy   |  86.76% |     80.54% |                      — |
+| Macro-F1   |  86.63% |     80.36% |              **92.8%** |
+| AUC-ROC    |  94.04% |     89.10% |              **94.7%** |
+| Parameters | 793,733 |      6,417 | **123.7× compression** |
+
+This 2026 study used
+Teacher: 12-lead InceptionTime-Transformer
+Student: single-lead Lead II DSConv
+on PTB-XL.
+
+2) HMT-KD on PTB-XL:
+A 2026 hierarchical multi-teacher KD study used PTB-XL on the follwing construct
+
+ResNet18 + SENet
+        +
+MobileNetV2
+        ↓
+Teacher Assistant
+        ↓
+Lightweight Student
+
+The student reportedly achieved 85.45% accuracy, 96.53% AUROC and >100× parameter reduction on PTB-XL.
+This is useful as a KD benchmark, although its architecture is substantially more complicated than what we likely want for ESP32.
+
+-----MIT-BIH-----
+
+1) KD Literature:
+There's a 2026 study distilling ECGFounder into compact students using MIT-BIH Arrhythmia and PTB-XL.
+It evaluates ECGFounder teacher, ResNet-1D student, lightweight CNN-1D student and a quantum-ready student
+For MIT-BIH, the reported teacher has:
+Recall ≈ 0.990
+F1 ≈ 0.840
+and the distilled students remain in approximately the 0.93–0.98 recall range.
+GPT doesn't recommend using this as a primary numerical benchmark yet because the task formulation and reported metrics differ substantially 
+from the standard five-class MIT-BIH AAMI benchmark.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+C) TINY ML/DL WITHOUT KD:
+
+------MIT-BIH------
+
+1) TinyML 1D-CNN on MIT-BIH:
+A 2026 TinyML feasibility study deployed a quantized 1D-CNN on an Arduino UNO.
+
+Task:
+3 classes:
+Normal
+Ventricular
+Supraventricular
+
+Results:
+Accuracy: 97.6%
+Sensitivity: 97.6%
+Memory footprint: <24 KB
+Inference time: ~200 ms/heartbeat
+
+This is an extremely useful TinyML benchmark, but it is a 3 class problem, not the intended 5-class AAMI problem.
+The authors themselves explicitly acknowledge that they simplified the classification task to make ultra-low-cost deployment feasible.
+
+2) TinyML five-class MIT-BIH:
+A 2024 IEEE TinyML study used a quantized deep-learning model for five-class ECG rhythm classification on MIT-BIH.
+They reported:
+Accuracy ≈ 97.34%
+F1 ≈ 0.96
+Model size: 143 KB
+Real-time microcontroller operation
+
+The model used extracted P/R/S wave features together with a two-input deep-learning architecture.
+This is much closer to the intended problem because it uses all five classes.
+
+3) RNN on STM32:
+A 2022 study evaluated RNN architectures on MIT-BIH and then ported them to an STM32 platform.
+The basic RNN had approximately:
+5k parameters
+~117 KB storage
+~150 ms inference
+
+while the LSTM variant achieved approximately 90% accuracy.
+This study is valuable because it explicitly evaluates resource usage on a microcontroller, rather than simply saying that the model is lightweight.
+
+4) FPGA SNN — MIT-BIH:
+Xing et al. developed a spiking neural network with channel-wise attention for five MIT-BIH heartbeat classes.
+They reported:
+Accuracy: 98.26%
+Sensitivity: 94.75%
+F1: 89.09%
+Latency: 1.37 ms/beat
+Energy: 346.33 μJ/beat
+
+but, under an inter-patient evaluation:
+Accuracy: 92.07%
+
+This is particularly useful because it demonstrates how dramatically the evaluation protocol can affect the apparent accuracy.
+
+5) FPGA 1D-CNN — MIT-BIH:
+A configurable FPGA inference engine tested two CNN models on MIT-BIH:
+| Model             | Accuracy | Energy/inference |
+| ----------------- | -------: | ---------------: |
+| Lightweight CNN   |    98.9% |          2.05 μJ |
+| High-accuracy CNN |    99.3% |         14.27 μJ |
+
+This demonstrates that 'Tiny' doesn't always mean highest accuracy with the smallest network.
+There's a measurable accuracy–energy–model-size trade-off.
+
+6) EdgeECG — MIT-BIH:
+A very recent 2026 edge-oriented model.
+EdgeECG uses compact CNN, dual-criterion pruning, quantization and STM32F103 deployment.
+The results were as follows:
+| Metric                                                |       Result |
+| ----------------------------------------------------- | -----------: |
+| Accuracy, standard evaluation                         |   **98.07%** |
+| Accuracy, patient-independent record-level evaluation |   **80.73%** |
+| Parameters                                            |    **2,680** |
+| Non-zero parameter reduction                          |         ~50% |
+| Inference latency                                     |  **0.025 s** |
+| Energy/inference                                      | **0.156 mJ** |
+| MCU                                                   |    STM32F103 |
+| SRAM                                                  |        64 KB |
+
+GPT suggests that this is one of the most important TinyDL benchmark for us.
+It highlights the huge difference between accuracy under the standard benchmark vs. patient independent evaluation.
+So, that is exactly why it strongly recommends that our FYP report both conventional benchmark results and a patient-independent test.
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+D) THE INTERSECTION: KD + TINYDL:
+
+1) PTB-XL — Cross-lead KD + Tiny student:
+The 2026 Edge–Cloud Collaborative ECG-Assisted Diagnostic System is the closest published architecture to this.
+Teacher: 12 lead PTB-XL --> InceptionTime --> Transformer
+Student: Lead-II only --> Depthwise-separable CNN --> binary classifier
+KD: Teacher --> soft labels + hard labels + auxiliary multi-label supervision --> Student
+
+The student contains only 6,417 parameters. The authors then quantize it to INT8 and test it under Cortex-M4 simulation.
+Below are the results:
+| Model            |   Accuracy |   Macro-F1 |        AUC |
+| ---------------- | ---------: | ---------: | ---------: |
+| Teacher          |     86.76% |     86.63% |     94.04% |
+| Student + KD     | **80.54%** | **80.36%** | **89.10%** |
+| TinyCNN          |     80.16% |     79.99% |     88.50% |
+| TinyResNet       |     80.39% |     80.21% |     88.71% |
+| Student, no KD   |     80.33% |     80.16% |     88.49% |
+| **Student + KD** | **80.54%** | **80.31%** | **89.06%** |
+
+According to GPT, the important result is that KD gives the tiny student a small accuracy/F1 improvement but a clearer improvement in AUC.
+The same study also reports the following hardware numbers:
+| Resource                    |   Teacher |   KD Student |
+| --------------------------- | --------: | -----------: |
+| Parameters                  |   793,733 |    **6,417** |
+| FP32 weight size            | ~3,101 KB | **~25.1 KB** |
+| INT8 weights                |         — |  **~6.3 KB** |
+| TFLite file                 |         — |  **20.8 KB** |
+| GPU latency                 |   2.46 ms |      0.38 ms |
+| Cortex-M4 simulated latency |         — |  **11.6 ms** |
+| Peak SRAM                   |         — |    **63 KB** |
+| Compression                 |        1× |   **123.7×** |
+
+This looks a good benchmark for the ESP32 feasibility.
+But an important limitation is that the Cortex-M4 result was obtained using QEMU simulation, not physical hardware. 
+The authors explicitly say physical MCU validation is still required.
+So we shouldn't present the 11.6 ms as a proven physical-device latency.
+
+A summary of all the task is:
+| Group              | Dataset        |                               Typical performance | Main metric         | Resource reporting           |
+| ------------------ | -------------- | ------------------------------------------------: | ------------------- | ---------------------------- |
+| Conventional ML/DL | MIT-BIH        |                                ~97–99.7% accuracy | Acc, Se, Sp, F1     | Usually poor                 |
+| Conventional DL    | PTB-XL         |                     ~0.88–0.93 AUC; ~0.72–0.77 F1 | Macro-AUC, Macro-F1 | Sometimes params             |
+| KD                 | MIT-BIH/PTB-XL | Generally retains substantial teacher performance | Acc/F1/AUC          | Parameters/compression       |
+| TinyML/TinyDL      | MIT-BIH        |                     ~90–99% depending on protocol | Acc, Se, F1         | **Latency/RAM/Flash/energy** |
+| KD + TinyDL        | PTB-XL         |             ~80.5% Acc, 80.3% Macro-F1, 0.891 AUC | Macro-F1/AUC        | **Excellent**                |
+| KD + TinyDL        | MIT-BIH        |                        Literature is much thinner | —                   | Major research gap           |
+
+GPT says there's a real literature gap here.
+After restricting the search to MIT-BIH and PTB-XL, the literature separates quite cleanly:
+                    ECG ARRHYTHMIA
+                         │
+        ┌────────────────┴────────────────┐
+        │                                 │
+   High accuracy                     Low-resource
+   conventional DL                  TinyML/TinyDL
+        │                                 │
+        │                                 │
+   MIT-BIH/PTB-XL                    MIT-BIH/PTB-XL
+        │                                 │
+        └──────────────┬──────────────────┘
+                       │
+                 KNOWLEDGE
+                 DISTILLATION
+                       │
+                       ↓
+               KD + TinyDL
+
+There are many papers in the top-left and bottom-right.
+But MIT-BIH-specific KD → TinyDL arrhythmia classification remains much less developed.
+The 2026 PTB-XL paper is also evidence that this direction is an emerging one.
+
+Finally, GPT recommends developing the following benchmark.
+
+
+-----------MIT-BIH Benchmark---------
+
+Classification:
+Do classification with the standard five AAMI superclasses
+N  = Normal
+S  = Supraventricular ectopic
+V  = Ventricular ectopic
+F  = Fusion
+Q  = Unknown
+
+Report:
+
+Primary:
+Macro-F1
+Balanced Accuracy
+
+Secondary:
+Accuracy
+Macro Precision
+Macro Recall
+Per-class Recall
+Per-class F1
+Confusion Matrix
+
+Deployment:
+Number of parameters
+Flash/model size
+Peak RAM
+MACs
+Inference latency
+Energy/inference
+
+
+-----------------PTB-XL Benchmark---------------
+
+Primary:
+Macro-AUROC
+Macro-F1
+
+Secondary:
+Accuracy
+Macro precision
+Macro recall
+per-class F1
+per-class AUROC
+AUPRC if available
+
+Deployment:
+parameters
+Flash
+RAM
+MACs
+latency
+energy
+
+
+
+Below I am also sharing some things from GPT which u might find useful:
+
+The most useful benchmark numbers for your proposal
+
+If I reduce the literature to the numbers I think your supervisor/committee will care about most:
+
+MIT-BIH conventional DL
+99.7% accuracy / 99.3% F1 — hierarchical DL.
+
+MIT-BIH CNN-BiLSTM
+99.33% accuracy / 91.65% average F1 / 93.67% sensitivity.
+
+MIT-BIH TinyML
+97.34% accuracy / F1 ≈ 0.96 / 143 KB — five-class quantized TinyML system.
+
+MIT-BIH TinyML, more constrained
+97.6% accuracy / <24 KB / 200 ms — but only three classes.
+
+MIT-BIH extreme TinyDL
+98.07% standard accuracy / 80.73% patient-independent accuracy / 2,680 parameters / 25 ms — EdgeECG.
+
+PTB-XL conventional DL
+0.927 Macro-AUC / 0.745 F1 — MS-LTCAF.
+
+PTB-XL KD + TinyDL
+80.54% accuracy / 80.36% Macro-F1 / 0.891 AUC / 6,417 parameters / 123.7× compression.
+
+PTB-XL KD + MCU simulation
+20.8 KB INT8 TFLite / 63 KB SRAM / 11.6 ms simulated Cortex-M4 latency.
+
+
+One more important point: MIT-BIH's published 99%+ numbers are often intra-patient/beat-level results, 
+whereas patient-independent evaluation can fall dramatically. The recent literature explicitly identifies patient leakage/split 
+strategy as a major reason for inflated MIT-BIH performance.
+
+So for your benchmark, I would make patient-independent evaluation + Macro-F1 + per-class recall + deployment cost mandatory. 
+That will make your eventual comparison much more credible than simply chasing the highest published accuracy.
