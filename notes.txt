@@ -1273,3 +1273,106 @@ strategy as a major reason for inflated MIT-BIH performance.
 
 So for your benchmark, I would make patient-independent evaluation + Macro-F1 + per-class recall + deployment cost mandatory. 
 That will make your eventual comparison much more credible than simply chasing the highest published accuracy.
+
+
+
+//ZAIN
+07-10-2026
+preprocessing step of the MIT-BIH
+source/preprocess.py
+
+---
+
+## preprocess.py — Pipeline Summary and Observations
+
+### What the script does
+
+preprocess.py implements steps 1–4 of the signal pipeline for the MIT-BIH dataset. It reads every usable record, filters the signal, locates R-peaks from the cardiologist annotations, and carves a fixed-length window around each beat. All beats are stacked into a single NumPy archive.
+
+The four steps, in order:
+
+**Step 1 — Load**
+wfdb.rdrecord() reads the .dat binary and converts raw ADC integers to millivolts using gain and baseline from the .hea file (physical = (digital − baseline) / gain). wfdb.rdann() reads the binary .atr file and resolves gap-encoded sample positions into absolute sample numbers. MLII is selected by name (record.sig_name.index("MLII")), not by hard-coded index 0 — this matters because some records (e.g. record 114) have MLII on channel 1, not 0. Both channels are loaded so the dataset can serve both single-channel (LightGBM) and two-channel (deep learning) experiments.
+
+**Step 2 — Filter**
+A 4th-order Butterworth band-pass filter (0.5–40 Hz) is applied zero-phase using scipy sosfiltfilt (forward + backward pass). The 0.5 Hz high-pass edge removes DC offset and slow baseline wander from breathing and electrode movement — the EDA noted record 100 MLII has a mean of –0.31 mV which this corrects. The 40 Hz low-pass removes high-frequency muscle (EMG) noise. QRS energy is concentrated below 40 Hz so all clinically relevant morphology is preserved. SOS (second-order sections) form is used rather than (b, a) coefficients for numerical stability. Zero-phase is essential: any time shift would displace Q, S, T relative to the annotated R-peak and corrupt interval features like QRS duration and QT. Signal is cast to float32 at this stage to halve memory use.
+
+**Step 3 — R-peaks**
+The cardiologist .atr annotations are used directly as R-peak ground truth. No algorithmic R-peak detection is performed. This avoids detector errors and keeps the labels exactly aligned with what the cardiologist marked.
+
+**Step 4 — Segmentation**
+A 256-sample window is cut around each annotated R-peak: 100 samples before (≈ 278 ms, covers the P-wave and PR interval) and 156 samples after (≈ 433 ms, covers the full T-wave). Total window = 711 ms at 360 Hz. Beats whose window extends past the recording boundary are dropped, not zero-padded — padding would introduce artificial edge signal that would distort amplitude, energy, and wavelet features. Only the five label symbols {N, L, R, V, A} are kept; non-beat symbols (+, ~, |, [, ], !, etc.) are discarded. Each beat is stored in channels-first format: shape (2, 256) with MLII always at index 0.
+
+**Parallelism**
+ThreadPoolExecutor with 8 workers is used because wfdb file I/O is the bottleneck. scipy/numpy filtering releases the GIL internally, so multiple threads can overlap filtering with I/O. All 44 records completed without error.
+
+---
+
+### Run output — key numbers
+
+Records found: 48
+Paced records excluded: 4 (102, 104, 107, 217) — pacing spikes have unnatural QRS morphology that would form a spurious cluster
+Usable records: 44
+
+All 44 records processed successfully (no skips, no errors).
+
+Beat counts per record ranged from 1,517 (record 123) to 3,361 (record 215).
+Records with notably high beat counts: 215 → 3,361, 209 → 3,004, 233 → 3,066, 203 → 2,972, 213 → 2,884.
+Records with notably low beat counts: 123 → 1,517, 117 → 1,534, 231 → 1,570, 124 → 1,579.
+
+Final dataset shape: (99,288, 2, 256)  — beats × channels × samples
+Total beats: 99,288
+Records represented: 44
+Memory as float32: 203.3 MB (in RAM)
+Compressed .npz file on disk: 178.8 MB
+
+Class distribution (raw MIT-BIH symbols, before any AAMI remapping):
+  N  Normal  74,513  (75.0%)
+  L  LBBB     8,072   (8.1%)
+  R  RBBB     7,255   (7.3%)
+  V  PVC      6,902   (7.0%)
+  A  APC      2,546   (2.6%)
+
+---
+
+### Observations and things to keep in mind
+
+1. **These are raw MIT-BIH symbols, not AAMI superclasses yet.**
+   The KEEP_LABELS here are {N, L, R, V, A}. The standard AAMI 5-class remapping
+   (L + R + N → N, A → S, V → V, F → F, fused/unknown → Q) has not been applied.
+   That remapping will need to happen before training if we use the AAMI benchmark.
+   Note that F (fusion) and Q (unknown/paced) beats are not in this dataset at all —
+   they were excluded at the KEEP_LABELS filter step. If we want F and Q in the
+   AAMI scheme, the KEEP_LABELS set must be expanded to include those symbols first.
+
+2. **Severe class imbalance.**
+   Normal beats are 75% of the dataset. APC (A) is only 2.6% — roughly 1 in 38 beats.
+   PVC (V) is 7.0%. This mirrors what the EDA showed for individual records (record 100:
+   2,239 N vs 33 A vs 1 V). The model will need oversampling, class weighting, or
+   focal loss to avoid collapsing to the majority class. Macro-F1 and per-class recall
+   are the right primary metrics precisely because accuracy alone would be misleadingly
+   high if the model predicts N for everything.
+
+3. **Window design trade-off.**
+   256 samples = 711 ms. The clarityBase paper specifies this window. SKILL.md mentions
+   a 720-sample (2 s) window as an alternative for deep-learning models. A 2-second
+   window would capture more surrounding beats (useful for HRV-style context) but would
+   quadruple the segment size and increase memory/model input dimension considerably.
+   The current 256-sample window is the right starting point.
+
+4. **Channels-first storage (2, 256) is the right convention for PyTorch.**
+   Channel-last (256, 2) would need a permutation before feeding a 1D Conv layer.
+   The transpose at line 172 (window.T) handles this during segmentation.
+
+5. **Output file location.**
+   datasets/processed/mit_bih_segments.npz  (178.8 MB on disk)
+   Load with: data = np.load("datasets/processed/mit_bih_segments.npz")
+   Arrays: data["segments"], data["labels"], data["record_ids"], data["r_samples"]
+
+6. **Patient-independent split must be done at the record level.**
+   record_ids stores the source record name for every beat. Any train/test split must
+   be done by grouping on record_ids — never by randomly shuffling individual beats —
+   otherwise beats from the same patient appear in both train and test sets (patient
+   leakage), which inflates accuracy by up to ~20 percentage points as shown in the
+   EdgeECG study (98.07% intra-patient vs 80.73% inter-patient).
+
