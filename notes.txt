@@ -1376,3 +1376,13 @@ Class distribution (raw MIT-BIH symbols, before any AAMI remapping):
    leakage), which inflates accuracy by up to ~20 percentage points as shown in the
    EdgeECG study (98.07% intra-patient vs 80.73% inter-patient).
 
+//Zain 
+10-10-2026
+the order in which we have to run: 
+  1. python source/preprocess.py   → datasets/processed/mit_bih_segments.npz
+  2. python source/features.py     → datasets/processed/mit_bih_features.npz
+  3. python source/split.py        → datasets/processed/split_random.npz
+                                      datasets/processed/split_ds1ds2.npz
+  4. python source/train.py        → models/lgbm_random.pkl + _optuna.json
+                                      models/lgbm_ds1ds2.pkl + _optuna.json
+  5. python source/evaluate.py     → printed tables + results/cm_*.png
