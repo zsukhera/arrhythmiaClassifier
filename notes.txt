@@ -1386,3 +1386,306 @@ the order in which we have to run:
   4. python source/train.py        → models/lgbm_random.pkl + _optuna.json
                                       models/lgbm_ds1ds2.pkl + _optuna.json
   5. python source/evaluate.py     → printed tables + results/cm_*.png
+
+
+---
+
+## Source File Summaries — What Each File Does and How They Connect
+//Zain 10-10-2026
+
+The pipeline has six files in source/. Five of them form a strict linear chain where
+each file's output is the next file's input. One (EDA_mit.py) is standalone.
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 1 — source/EDA_mit.py
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Exploratory data analysis script. Loads MIT-BIH record 100 and prints everything
+  inside the three file formats (.hea, .atr, .dat). Verifies the gain/baseline
+  conversion formula, checks per-channel checksums, and plots the raw ECG signal
+  with annotations overlaid.
+
+Inputs:  datasets/mitbih/mitdb/100.{hea,dat,atr}
+Outputs: None (prints to terminal, shows matplotlib plots)
+
+Role in the pipeline:
+  Standalone — does not feed into any other script. Run it once to build intuition
+  about the data before touching the pipeline. All observations from it are recorded
+  in the EDA section of this file.
+
+How to run:
+  source .venv/bin/activate
+  python source/EDA_mit.py
+  (or open it as a notebook in VS Code / Jupyter — it is structured as % cells)
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 2 — source/preprocess.py   [PIPELINE STEP 1–4]
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Reads all 44 usable MIT-BIH records (48 total minus 4 paced: 102, 104, 107, 217).
+  For each record it does four things in sequence:
+    1. LOAD   — wfdb.rdrecord() converts raw .dat ADC integers to millivolts using
+                the gain/baseline from .hea. Picks MLII by name, not hard-coded index,
+                because record 114 has MLII on channel 1, not 0.
+    2. FILTER — 4th-order Butterworth bandpass 0.5–40 Hz, zero-phase (sosfiltfilt).
+                0.5 Hz removes DC offset and baseline wander; 40 Hz removes EMG noise.
+                Zero-phase is critical: a shift would displace Q/S/T relative to the
+                annotated R-peak and corrupt all interval features.
+    3. R-PEAKS — uses cardiologist .atr annotations directly as ground truth R-peak
+                 positions. No algorithmic peak detector.
+    4. SEGMENT — cuts a 256-sample window per beat: 100 samples before R, 156 after.
+                 Keeps only {N, L, R, V, A} labels. Drops beats at the recording
+                 boundary (no zero-padding). Stores channels-first: shape (2, 256)
+                 with MLII always at index 0.
+  Uses ThreadPoolExecutor (8 workers) for parallel I/O across the 44 records.
+
+Inputs:  datasets/mitbih/mitdb/*.{hea,dat,atr}
+Outputs: datasets/processed/mit_bih_segments.npz
+           segments   (99,288, 2, 256) float32  — beats × channels × samples
+           labels     (99,288,)        str      — beat symbol
+           record_ids (99,288,)        str      — source record name
+           r_samples  (99,288,)        int32    — R-peak position in samples
+
+Key numbers: 99,288 beats | N 75% | L 8.1% | R 7.3% | V 7.0% | A 2.6%
+Note: these are raw MIT-BIH symbols, NOT AAMI superclasses yet.
+
+How to run:
+  source .venv/bin/activate
+  python source/preprocess.py
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 3 — source/features.py   [PIPELINE STEP 5]
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Loads the 99,288 beat segments from preprocess.py and extracts a 40-feature vector
+  per beat. Uses only the MLII channel (index 0). Processes each record in
+  chronological beat order so the HRV window always refers to truly preceding beats.
+  Uses ThreadPoolExecutor (8 workers) across records.
+
+  The 40 features are organised in 4 groups:
+    Group A  Statistical (6):
+      mean, std, peak-to-peak, skewness, kurtosis, RMS — over the 256-sample window.
+    Group B  Fiducial (13):
+      B1 Intervals (5): RR_pre, RR_post (ms), QRS duration, QT interval, P duration
+      B2 Morphology (8): R/Q/S/T/P amplitudes, R/S ratio, P/R ratio, ST elevation
+      Q and S are found by windowed argmin before/after R. T and P by windowed argmax.
+      P duration uses FWHM (full-width at half-maximum).
+    Group C  Wavelet DWT (12):
+      db4 4-level decomposition → [cA4, cD4, cD3, cD2, cD1].
+      Per subband: energy (Σc²) + normalised Shannon entropy = 10 features.
+      Plus total energy and cD1 relative energy = 12 total.
+    Group D  HRV / Non-linear (9):
+      D1 Time+Freq (5): SDNN, RMSSD, LF power (0.04–0.15 Hz), HF power (0.15–0.40 Hz),
+                        LF/HF ratio. LF/HF via Welch PSD on uniformly resampled RR series.
+      D2 Non-linear (4): Poincaré SD1, SD2, Sample Entropy (m=2, r=0.2·SD), SD1/SD2 ratio.
+      HRV window: last min(50, available) RR intervals per record.
+
+  Any remaining NaN values are imputed with per-column medians before saving.
+
+Inputs:  datasets/processed/mit_bih_segments.npz   ← output of preprocess.py
+Outputs: datasets/processed/mit_bih_features.npz
+           X            (99,288, 40) float32
+           y            (99,288,)    str
+           record_ids   (99,288,)    str
+           r_samples    (99,288,)    int32
+           feature_names (40,)       str
+
+How to run:
+  source .venv/bin/activate
+  python source/features.py
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 4 — source/split.py   [PIPELINE STEP 6]
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Loads the feature matrix from features.py and creates two independent train/test
+  splits, saving each as a separate .npz:
+
+  Split 1 — Random stratified 80/20 (seed=42):
+    Beats are randomly assigned to train/test while maintaining class proportions.
+    Patient identity can bleed across sets (same patient's beats in both train and test).
+    Reproduces the paper's reported numbers but is optimistic — use only for comparison
+    with other papers that use the same protocol.
+
+  Split 2 — Inter-patient DS1/DS2 (de Chazal 2004):
+    DS1 (22 records) → training; DS2 (22 records) → test.
+    No patient appears in both sets. This is the honest, publishable evaluation.
+    Expected to show ~15-20% lower accuracy than the random split (matches the EdgeECG
+    study: 98.07% intra-patient vs 80.73% inter-patient).
+
+  Each output stores: indices_train, indices_test, X_train, X_test, y_train, y_test,
+  record_ids_train, record_ids_test.
+
+Inputs:  datasets/processed/mit_bih_features.npz   ← output of features.py
+Outputs: datasets/processed/split_random.npz
+         datasets/processed/split_ds1ds2.npz
+
+How to run:
+  source .venv/bin/activate
+  python source/split.py
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 5 — source/train.py   [PIPELINE STEP 7]
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Trains a LightGBM classifier on both splits (random and ds1ds2). For each split:
+    1. Runs 100 Optuna trials with TPE sampler, optimising stratified 5-fold macro-F1.
+       SMOTE oversampling is applied inside each CV fold (not before) to prevent
+       synthetic data leaking into validation. Trial 0 is always the paper's reported
+       hyperparameters so that configuration is always evaluated.
+    2. Takes the best hyperparameters and refits on the full training set with SMOTE.
+    3. Saves the final model as a pickle and the Optuna metadata as JSON.
+
+  GPU probe at startup: calls nvidia-smi; if an NVIDIA GPU is present, tries
+  LightGBM device='cuda' then device='gpu' (OpenCL). Falls back to CPU if both fail.
+  On CPU, uses n_jobs=-1 (all cores). On GPU, uses n_jobs=1 (GPU handles its own
+  parallelism — nested threads would conflict).
+
+  Paper's hyperparameters (seeded as trial 0):
+    n_estimators=1450, max_depth=11, learning_rate=0.05, num_leaves=38,
+    subsample=0.85, colsample_bytree=0.75, subsample_freq=1
+
+Inputs:  datasets/processed/split_random.npz    ← output of split.py
+         datasets/processed/split_ds1ds2.npz    ← output of split.py
+Outputs: models/lgbm_random.pkl
+         models/lgbm_ds1ds2.pkl
+         models/lgbm_random_optuna.json
+         models/lgbm_ds1ds2_optuna.json
+
+WARNING: train.py requires packages NOT currently in the venv:
+  lightgbm, optuna, imbalanced-learn (imblearn)
+  Install with: pip install lightgbm optuna imbalanced-learn
+
+How to run:
+  source .venv/bin/activate
+  pip install lightgbm optuna imbalanced-learn   # first time only
+  python source/train.py
+  (expect ~1–2 hours on CPU for 100 trials × 2 splits × 5-fold CV)
+
+─────────────────────────────────────────────────────────────────────────────────────
+FILE 6 — source/evaluate.py   [PIPELINE STEP 8]
+─────────────────────────────────────────────────────────────────────────────────────
+What it does:
+  Loads the trained models and test splits from the previous two steps and runs three
+  evaluation passes:
+
+  1. Main evaluation (both splits):
+     5-class metrics: accuracy, per-class precision/recall/F1, macro-F1, macro OVR AUC.
+     Binary anomaly (N vs {L,R,V,A}): precision, recall, F1, AUC.
+     Prints results alongside the paper's reported numbers for direct comparison.
+     Saves confusion matrix PNGs to results/.
+
+  2. Ablation A1→A4 (random split only, paper params):
+     Trains 4 models using growing feature subsets: 6 / 19 / 31 / 40 features.
+     Shows the marginal contribution of each feature group.
+     Compares to §8.2 of clarityBase.txt.
+
+  3. Synergy test (random split only):
+     Trains GBC (original CLARITY-AI baseline) and LightGBM on 6 vs 40 features.
+     Shows the interaction between model choice and feature richness.
+     Compares to §8.3 of clarityBase.txt.
+
+Inputs:  models/lgbm_random.pkl            ← output of train.py
+         models/lgbm_ds1ds2.pkl            ← output of train.py
+         datasets/processed/split_random.npz
+         datasets/processed/split_ds1ds2.npz
+Outputs: printed metric tables (to terminal)
+         results/cm_random_5class.png
+         results/cm_ds1ds2_5class.png
+
+WARNING: evaluate.py also requires lightgbm and imbalanced-learn (same as train.py).
+
+How to run:
+  source .venv/bin/activate
+  python source/evaluate.py
+
+
+─────────────────────────────────────────────────────────────────────────────────────
+DATA FLOW — How the Files Connect
+─────────────────────────────────────────────────────────────────────────────────────
+
+  datasets/mitbih/mitdb/*.{hea,dat,atr}
+          │
+          ▼
+  source/preprocess.py
+          │  datasets/processed/mit_bih_segments.npz  (99,288 × 2 × 256)
+          ▼
+  source/features.py
+          │  datasets/processed/mit_bih_features.npz  (99,288 × 40)
+          ▼
+  source/split.py
+          │  datasets/processed/split_random.npz
+          │  datasets/processed/split_ds1ds2.npz
+          ▼
+  source/train.py
+          │  models/lgbm_random.pkl + lgbm_ds1ds2.pkl
+          │  models/lgbm_*_optuna.json
+          ▼
+  source/evaluate.py
+             results/cm_*.png  +  printed tables
+
+  source/EDA_mit.py — standalone, no connection to the above chain.
+
+
+─────────────────────────────────────────────────────────────────────────────────────
+EXECUTION — Full Pipeline Commands
+─────────────────────────────────────────────────────────────────────────────────────
+
+  # Activate the virtual environment (do this once per terminal session)
+  source .venv/bin/activate
+
+  # Install missing packages needed by train.py and evaluate.py (first time only)
+  pip install lightgbm optuna imbalanced-learn
+
+  # Run the pipeline in order — each step depends on the previous one's output
+  python source/preprocess.py     # ~30 s  — produces mit_bih_segments.npz
+  python source/features.py       # ~2–5 min — produces mit_bih_features.npz
+  python source/split.py          # <5 s   — produces split_random.npz + split_ds1ds2.npz
+  python source/train.py          # ~1–2 h on CPU, ~10–20 min with GPU — produces models/
+  python source/evaluate.py       # ~5–15 min — prints tables, saves results/cm_*.png
+
+  # EDA (optional, standalone)
+  python source/EDA_mit.py        # prints record 100 metadata and shows ECG plots
+
+
+─────────────────────────────────────────────────────────────────────────────────────
+GPU STATUS — NVIDIA GPU IN THIS WSL2 SETUP
+─────────────────────────────────────────────────────────────────────────────────────
+
+Hardware detected: NVIDIA Quadro P520, 4 GB VRAM
+Driver version:    582.42 (Windows host driver)
+CUDA version:      13.0
+nvidia-smi:        working inside WSL2 ✓
+
+The GPU IS visible and usable from WSL2. The driver is the Windows GPU-P (paravirtual)
+driver that WSL2 uses to expose the host GPU — this is the expected setup and means
+CUDA-capable software can see the GPU without any extra configuration.
+
+Current venv status:
+  - PyTorch:      NOT installed (not in requirements.txt, not needed for this pipeline)
+  - LightGBM:     NOT installed (required by train.py and evaluate.py — install it)
+  - optuna:       NOT installed (required by train.py — install it)
+  - imbalanced-learn: NOT installed (required by train.py and evaluate.py — install it)
+
+How train.py uses the GPU:
+  At startup, _probe_device() runs nvidia-smi. If it succeeds, it tries fitting a tiny
+  LightGBM model with device='cuda' (LightGBM >= 4.0 bundles CUDA support in the
+  standard wheel). If that fails it tries device='gpu' (OpenCL). If both fail it logs
+  "[device] GPU probe failed — falling back to CPU." and continues on CPU.
+  The Quadro P520 supports CUDA and OpenCL, so LightGBM should pick it up automatically
+  once the package is installed.
+
+  LightGBM GPU acceleration primarily speeds up the histogram construction step.
+  For the dataset size here (99k beats, 40 features), the speedup will be moderate
+  (roughly 3–10× faster per trial vs CPU), but with 100 Optuna trials × 2 splits the
+  total wall-clock time should drop from ~1–2 hours to ~10–30 minutes.
+
+To verify GPU is working after installing LightGBM:
+  python -c "
+  import lightgbm as lgb, numpy as np
+  rng = np.random.default_rng(0)
+  X = rng.random((500, 20)).astype(np.float32)
+  y = (X[:, 0] > 0.5).astype(int)
+  lgb.LGBMClassifier(device='cuda', n_estimators=5, verbose=-1).fit(X, y)
+  print('LightGBM CUDA: OK')
+  "
