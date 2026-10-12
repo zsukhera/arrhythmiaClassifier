@@ -9,6 +9,7 @@ contourpy==1.4.0
 cycler==0.12.1
 fonttools==4.66.0
 frozenlist==1.8.0
+ninja==1.13.2
 fsspec==2026.9.0
 idna==3.20
 kiwisolver==1.5.1

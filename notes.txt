@@ -1552,10 +1552,6 @@ Outputs: models/lgbm_random.pkl
          models/lgbm_random_optuna.json
          models/lgbm_ds1ds2_optuna.json
 
-WARNING: train.py requires packages NOT currently in the venv:
-  lightgbm, optuna, imbalanced-learn (imblearn)
-  Install with: pip install lightgbm optuna imbalanced-learn
-
 How to run:
   source .venv/bin/activate
   pip install lightgbm optuna imbalanced-learn   # first time only
