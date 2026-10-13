@@ -31,7 +31,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
-from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -258,61 +257,7 @@ def run_ablation() -> None:
 
 # %%
 
-def _gbc_binary_f1(
-    X_tr: np.ndarray, y_tr: np.ndarray,
-    X_te: np.ndarray, y_te: np.ndarray,
-) -> float:
-    """Train GBC (default params, original CLARITY-AI baseline) + SMOTE → binary F1."""
-    X_res, y_res = SMOTE(random_state=SEED).fit_resample(X_tr, y_tr)
-    model        = GradientBoostingClassifier(random_state=SEED)
-    model.fit(X_res, y_res)
-    y_bin      = to_binary(y_te)
-    y_bin_pred = to_binary(np.asarray(model.predict(X_te)))
-    return float(f1_score(y_bin, y_bin_pred, zero_division=0))
-
-
-def run_synergy() -> None:
-    print(f"\n{'═'*62}")
-    print("MODEL × FEATURE-SET SYNERGY  (binary anomaly F1)")
-    print("cf. clarityBase.txt §8.3")
-    print(f"{'═'*62}")
-
-    split_path = PROC_DIR / "split_random.npz"
-    if not split_path.exists():
-        print("  [skip] split_random.npz not found.")
-        return
-
-    data    = np.load(split_path, allow_pickle=True)
-    X_train = data["X_train"]
-    y_train = data["y_train"]
-    X_test  = data["X_test"]
-    y_test  = data["y_test"]
-
-    s6  = slice(0, 6)
-    s40 = slice(0, 40)
-
-    print("\n  Training 4 models ...", flush=True)
-    gbc_6   = _gbc_binary_f1(X_train[:, s6],  y_train, X_test[:, s6],  y_test)
-    gbc_40  = _gbc_binary_f1(X_train[:, s40], y_train, X_test[:, s40], y_test)
-    lgbm_6  = _lgbm_with_paper_params(
-        X_train[:, s6],  y_train, X_test[:, s6],  y_test)["anom_f1"]
-    lgbm_40 = _lgbm_with_paper_params(
-        X_train[:, s40], y_train, X_test[:, s40], y_test)["anom_f1"]
-
-    sep = f"  {'─'*44}"
-    print(f"\n  {'Model':<22}{'6 features':>12}{'40 features':>12}")
-    print(sep)
-    print(f"  {'GBC (original)':<22}{gbc_6:>12.3f}{gbc_40:>12.3f}")
-    print(f"  {'LightGBM':<22}{lgbm_6:>12.3f}{lgbm_40:>12.3f}")
-    print(sep)
-    print(f"  Paper (§8.3):")
-    print(f"  {'GBC (original)':<22}{'0.841':>12}{'0.912':>12}")
-    print(f"  {'LightGBM':<22}{'0.860':>12}{'0.928':>12}")
-
-# %%
-
 if __name__ == "__main__":
     run_main_eval()
     run_ablation()
-    run_synergy()
     print("\nDone.")
