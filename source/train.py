@@ -141,7 +141,7 @@ def _probe_device() -> str:
 
 DEVICE = _probe_device()
 
-N_TRIALS = 100
+N_TRIALS = 10
 N_CV_FOLDS = 5
 SEED = 42
 
