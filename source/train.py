@@ -98,7 +98,7 @@ def _probe_device() -> str:
 
     failures: dict[str, str] = {}
 
-    for dev in ("cuda", "gpu"):
+    for dev in ("gpu", "cuda"):
         try:
             LGBMClassifier(
                 device=dev,
