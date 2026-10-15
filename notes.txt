@@ -1685,3 +1685,154 @@ To verify GPU is working after installing LightGBM:
   lgb.LGBMClassifier(device='cuda', n_estimators=5, verbose=-1).fit(X, y)
   print('LightGBM CUDA: OK')
   "
+
+
+─────────────────────────────────────────────────────────────────────────────────────
+EVALUATION RUN 1 — RESULTS AND ROOT CAUSE ANALYSIS
+//Zain 14-10-2026
+─────────────────────────────────────────────────────────────────────────────────────
+
+Ran the full evaluation (source/evaluate.py) on both trained models on 2026-10-13.
+The results exposed a fundamental problem with the DS1/DS2 split that required a
+redesign of the feature processing pipeline.
+
+--- RESULTS ---
+
+Random split (19,858 test beats):
+
+  Metric      Ours    Paper   Delta
+  Accuracy    0.9960  0.989   +0.007
+  Macro-F1    0.9875  ~0.937  +0.050
+  Binary F1   0.9928  0.928   +0.065
+  OVR AUC     0.9992  0.985   +0.014
+
+  Per-class F1: N=0.998  L=0.997  R=0.998  V=0.991  A=0.954
+  Exceeds the paper on every metric. CV F1 (0.9864) closely matches held-out F1 —
+  no overfitting in the traditional sense.
+
+DS1/DS2 split (48,981 test beats):
+
+  Metric      Ours    Paper   Delta
+  Accuracy    0.7372  0.989   -0.252
+  Macro-F1    0.3132  ~0.937  -0.624
+  Binary F1   0.3419  0.928   -0.586
+  OVR AUC     0.7686  0.985   -0.217
+
+  Per-class F1: N=0.838  L=0.000  R=0.006  V=0.655  A=0.067
+  LBBB completely missed. RBBB near-zero. CV F1 on DS1 training was 0.9856 — the
+  model is not underfitting. High train CV + collapsed test = distribution shift.
+
+Ablation A1→A4 (random split, paper params):
+
+  Config            Feats  Acc    AnomF1   Paper Acc
+  A1 Statistical      6   0.924   0.875    0.985
+  A2 +Fiducial       19   0.994   0.990    0.987
+  A3 +Wavelet        31   0.995   0.991    0.988
+  A4 +HRV/NonLin     40   0.996   0.993    0.989
+
+  The A1→A2 jump in our implementation is enormous (+0.070 accuracy, +0.115 anom-F1)
+  vs the paper's modest +0.002. This is the fingerprint of patient-identity leakage
+  through absolute amplitude features on the random split.
+
+--- ROOT CAUSE ---
+
+This is an inter-patient generalisation failure. Three mechanisms combine:
+
+1. ABSOLUTE AMPLITUDE FEATURES
+   fid_r_amp, fid_q_amp, fid_s_amp, fid_t_amp, fid_p_amp, and the wavelet energy
+   bands all capture the absolute voltage scale of the signal. That scale is set by
+   electrode placement, body composition, and the patient's cardiac axis — none of
+   which are arrhythmia-specific. The model learns "LBBB has a broad QRS at ~1.2 mV"
+   from DS1 patients. DS2 patients with LBBB may have that same broad QRS at ~0.6 mV.
+   The model classifies them as Normal because it never saw that scale during training.
+
+2. LBBB/RBBB ARE MORPHOLOGY-DEPENDENT
+   Bundle branch blocks are diagnosed by the SHAPE of the QRS (wide, notched, specific
+   lead patterns), not absolute amplitude. If the amplitude scale encodes patient
+   identity, the model cannot separate morphology from identity across the DS1/DS2
+   patient boundary.
+
+3. SMOTE REINFORCES PATIENT-SPECIFIC DISTRIBUTIONS
+   SMOTE synthesises minority-class examples by interpolating within the existing
+   training data. All LBBB training examples come from DS1 patients with a certain
+   amplitude range — SMOTE creates more synthetic LBBB beats inside that same range,
+   doubling down on DS1's distribution rather than generalising beyond it.
+
+The random split hides all of this because the same patient's beats appear in both
+train and test. The model partially learns "who is this patient" and recognition at
+test time is easy. The DS1/DS2 split removes that shortcut entirely.
+
+--- NEW EXPERIMENTAL SETUP (implemented 14-10-2026) ---
+
+Two normalisation fixes were applied to source/features.py inside process_record():
+
+FIX 1 — Per-record amplitude normalisation:
+  Before extracting features for any beat, compute the amplitude scale of the record:
+
+    record_r_amps = segments[sorted_global, 0, R_IDX]   # all R-peak values in record
+    scale = median(|record_r_amps|) + 1e-6
+
+  Every beat waveform is then divided by this scale before feature extraction:
+
+    beat = raw_beat / scale
+
+  Effect: all amplitude-derived features — Group A (mean, std, ptp, RMS), Group B2
+  (r_amp, q_amp, s_amp, t_amp, p_amp, rs_ratio, pr_ratio, st_elev), and Group C
+  (wavelet energies, which scale as amplitude²) — become dimensionless ratios relative
+  to the record's own typical R-amplitude. A patient with large-amplitude ECG and a
+  patient with small-amplitude ECG will now produce numerically similar features for
+  the same arrhythmia morphology.
+
+  This is NOT z-score normalisation (z = (x − mean) / std). Z-score is applied
+  across features to put them on the same scale for distance-based models. What we
+  are doing is a per-record ratio scaling — dividing by a single reference value per
+  patient — to remove electrode placement and cardiac axis from the feature values.
+  LightGBM is tree-based and ignores scale across features anyway; the goal here is
+  purely to make the same arrhythmia look the same across different patients.
+
+FIX 2 — Per-record RR interval normalisation:
+  Before the beat loop, compute the record's mean RR interval:
+
+    mean_rr = mean(rr_ms) if len(rr_ms) > 0 else 800.0   # ms
+
+  rr_pre and rr_post are then normalised before being passed as features:
+
+    rr_pre_norm  = rr_pre  / (mean_rr + 1e-6)
+    rr_post_norm = rr_post / (mean_rr + 1e-6)
+
+  The features fid_rr_pre_ms and fid_rr_post_ms are renamed fid_rr_pre_norm and
+  fid_rr_post_norm to reflect that they are now dimensionless ratios, not milliseconds.
+
+  Effect: a PVC (premature beat) has a characteristically short preceding RR interval.
+  In absolute ms, that short interval might be 480 ms for one patient (baseline 800 ms)
+  and 350 ms for another (baseline 600 ms). Both look very different to the model.
+  As a ratio, both become ~0.60 — the model can now learn "ectopic beat = RR ratio
+  well below 1.0" regardless of the patient's baseline heart rate.
+
+  The HRV window (rr_window) is NOT normalised. SDNN and RMSSD measure the variability
+  of the RR series and are already relative to the patient's own rhythm by construction.
+  Normalising the window would distort the absolute time-domain and frequency-domain
+  HRV features (LF, HF power) which depend on the absolute interval lengths.
+
+FIX 3 — Increased Optuna trials (train.py):
+  N_TRIALS changed from 10 to 50. The previous search only ran 9 TPE-sampled trials
+  beyond the paper-params seed (trial 0). With normalised features the hyperparameter
+  landscape changes, so a wider search is warranted.
+
+STALE CHECKPOINTS DELETED:
+  The DS1/DS2 Optuna checkpoint (lgbm_ds1ds2_optuna.db, lgbm_ds1ds2_search_complete.json)
+  and model (lgbm_ds1ds2.pkl, lgbm_ds1ds2_optuna.json) were deleted. Those 10 trials were
+  optimised for unnormalised features — keeping them would seed the new search with results
+  from a different problem. The random split model was left untouched (already exceeds paper).
+
+NEXT STEP — Re-run the pipeline from features.py onwards:
+  python source/features.py   # rebuilds mit_bih_features.npz with normalised features
+  python source/split.py      # rebuilds split_random.npz + split_ds1ds2.npz
+  python source/train.py      # retrains both models (DS1/DS2: 50 fresh trials)
+  python source/evaluate.py   # re-evaluates
+
+Expected outcome: DS1/DS2 accuracy should rise substantially toward the paper's 0.989.
+LBBB and RBBB F1 should recover from ~0.000 to meaningful values. Random split accuracy
+will remain near ceiling (~0.996) since it already exceeds the paper.
+
+─────────────────────────────────────────────────────────────────────────────────────

@@ -56,7 +56,7 @@ FEATURE_NAMES = [
     # A — Statistical (6)
     "stat_mean", "stat_std", "stat_ptp", "stat_skewness", "stat_kurtosis", "stat_rms",
     # B1 — Fiducial intervals (5)
-    "fid_rr_pre_ms", "fid_rr_post_ms", "fid_qrs_dur_ms", "fid_qt_interval_ms", "fid_p_dur_ms",
+    "fid_rr_pre_norm", "fid_rr_post_norm", "fid_qrs_dur_ms", "fid_qt_interval_ms", "fid_p_dur_ms",
     # B2 — Fiducial morphology (8)
     "fid_r_amp", "fid_q_amp", "fid_s_amp", "fid_t_amp", "fid_p_amp",
     "fid_rs_ratio", "fid_pr_ratio", "fid_st_elev",
@@ -330,8 +330,18 @@ def process_record(
     # RR intervals (ms) between consecutive beats
     rr_ms = np.diff(sorted_rsamp).astype(float) / FS * 1000.0
 
+    # Per-record amplitude scale: median absolute R-amplitude across all beats in this record.
+    # Dividing each beat by this factor makes amplitude features record-relative rather than
+    # absolute — removing electrode placement / cardiac axis as a patient-identity cue.
+    record_r_amps = segments[sorted_global, 0, R_IDX]
+    scale = float(np.median(np.abs(record_r_amps))) + 1e-6
+
+    # Per-record mean RR used to normalise rr_pre / rr_post to a dimensionless ratio.
+    # This removes baseline heart rate as a confound across patients.
+    mean_rr = float(np.mean(rr_ms)) if len(rr_ms) > 0 else 800.0
+
     for pos in range(n):
-        beat  = segments[sorted_global[pos], 0, :]   # channel 0 = MLII
+        beat  = segments[sorted_global[pos], 0, :] / scale   # amplitude-normalised
 
         rr_pre  = rr_ms[pos - 1] if pos > 0     else np.nan
         rr_post = rr_ms[pos]     if pos < n - 1 else np.nan
@@ -349,7 +359,11 @@ def process_record(
         if len(rr_window) == 0:
             rr_window = np.array([win_mean])
 
-        feat_vec          = extract_beat_features(beat, rr_pre, rr_post, rr_window)
+        # Normalise RR intervals to record mean (dimensionless ratio)
+        rr_pre_norm  = rr_pre  / (mean_rr + 1e-6)
+        rr_post_norm = rr_post / (mean_rr + 1e-6)
+
+        feat_vec          = extract_beat_features(beat, rr_pre_norm, rr_post_norm, rr_window)
         X_rec[order[pos]] = feat_vec   # store at original (un-sorted) position
 
     return X_rec

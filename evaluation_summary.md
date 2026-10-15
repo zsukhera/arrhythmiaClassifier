@@ -132,3 +132,101 @@ python source/evaluate.py    # re-evaluates
 ## Expected Outcome
 
 Fixes 1 and 2 alone should substantially close the DS1/DS2 gap by removing patient-identity leakage from amplitude and timing features. The random split accuracy will stay at ceiling (~0.996) since it already has full patient coverage. LBBB and RBBB F1 on DS1/DS2 should recover from near-zero to something meaningful once the model stops relying on absolute amplitude cues.
+
+---
+zain's query:
+read the evaluation_summary.md. and the whole directory ofc. tell me if we                     
+    follow what has been written in the evaluatoin summary, won't that count as not              
+    following the base paper ? and secondly, when the model approaching the weights              
+    of the paper, does it automatically stop? how about if we begin with the                     
+    parameters of the paper and run the optuna trials one by one to further improve              
+    those parameters. so how would that be ?    
+
+1. Does following the evaluation_summary.md conflict with the base paper?
+  
+  No — it's the opposite. The paper achieves 0.989 accuracy on DS1/DS2. Your implementation gets
+  0.737 on the same split. The summary's fixes (amplitude normalisation, RR normalisation) are
+  meant to close the gap to the paper, not diverge from it.
+
+  The root cause is that your current features.py uses absolute amplitude values (fid_r_amp,
+  fid_q_amp, etc.) which encode patient-specific electrode placement — not arrhythmia patterns.
+  The paper presumably uses features that are relative/patient-agnostic, which is why it
+  generalises across patients in DS1/DS2. Applying the summary's normalisation recommendations
+  brings your feature engineering in line with what the paper must have done to achieve 0.989 on
+  that split.
+
+  Random split is already fine (0.996 vs paper's 0.989), so the summary only really matters for
+  DS1/DS2.
+
+  ---
+  2. Does the model automatically stop when approaching the paper's hyperparameters?
+  
+  No. The stopping criterion is purely N_TRIALS = 10 (total trials completed). The paper params
+  are enqueued as trial 0 (train.py:439), then Optuna runs 9 more TPE-sampled trials. Whatever
+  trial scores the highest CV macro-F1 wins — there's no proximity-to-paper logic anywhere. If
+  the paper params happen to score best, they get used; if trial 7 finds something better, that
+  wins instead.
+
+  ---
+  3. Starting from paper params and running Optuna to improve — how does that work?
+  
+  The code already does this. PAPER_PARAMS is enqueued as trial 0 (train.py:428-441). Optuna's
+  TPE sampler uses all completed trials (including trial 0) to build a probabilistic model of
+  which regions of hyperparameter space look promising, then samples from there. So trial 0
+  (paper params) directly seeds the search direction.
+
+  The current limitation is that only 10 trials total are run — and trial 0 is the paper. That
+  means only 9 new candidates get explored, which is very thin. The summary's recommendation of
+  bumping N_TRIALS to 50 makes sense: with more trials, TPE has more signal to refine from the
+  paper's starting point.
+
+  One thing to note: because the existing DS1/DS2 checkpoint (.db) already has 10 completed
+  trials, simply raising N_TRIALS = 50 and rerunning will only add 40 more trials on top of the
+  existing ones — it won't restart. However, the summary also recommends deleting the DS1/DS2
+  checkpoint first (step 4) since the features are going to change (steps 1–2), making the old
+  search results meaningless anyway. So the workflow is:
+
+  1. Fix features.py (normalise amplitude + RR)
+  2. Rebuild the splits
+  3. Delete the old DS1/DS2 checkpoint
+  4. Raise N_TRIALS = 50 in train.py
+  which regions of hyperparameter space look promising, then samples from there. So trial 0
+  (paper params) directly seeds the search direction.
+
+  The current limitation is that only 10 trials total are run — and trial 0 is the paper. That
+  means only 9 new candidates get explored, which is very thin. The summary's recommendation of
+  bumping N_TRIALS to 50 makes sense: with more trials, TPE has more signal to refine from the
+  paper's starting point.
+
+  One thing to note: because the existing DS1/DS2 checkpoint (.db) already has 10 completed
+  trials, simply raising N_TRIALS = 50 and rerunning will only add 40 more trials on top of the
+  existing ones — it won't restart. However, the summary also recommends deleting the DS1/DS2
+  checkpoint first (step 4) since the features are going to change (steps 1–2), making the old
+  search results meaningless anyway. So the workflow is:
+
+  1. Fix features.py (normalise amplitude + RR)
+  2. Rebuild the splits
+  3. Delete the old DS1/DS2 checkpoint
+  4. Raise N_TRIALS = 50 in train.py
+  5. Retrain — paper params seed trial 0 again, then 49 more trials explore from there
+
+✻ Crunched for 46s
+  which regions of hyperparameter space look promising, then samples from there. So trial 0
+  (paper params) directly seeds the search direction.
+
+  The current limitation is that only 10 trials total are run — and trial 0 is the paper. That
+  means only 9 new candidates get explored, which is very thin. The summary's recommendation of
+  bumping N_TRIALS to 50 makes sense: with more trials, TPE has more signal to refine from the
+  paper's starting point.
+
+  One thing to note: because the existing DS1/DS2 checkpoint (.db) already has 10 completed
+  trials, simply raising N_TRIALS = 50 and rerunning will only add 40 more trials on top of the
+  existing ones — it won't restart. However, the summary also recommends deleting the DS1/DS2
+  checkpoint first (step 4) since the features are going to change (steps 1–2), making the old
+  search results meaningless anyway. So the workflow is:
+
+  1. Fix features.py (normalise amplitude + RR)
+  2. Rebuild the splits
+  3. Delete the old DS1/DS2 checkpoint
+  4. Raise N_TRIALS = 50 in train.py
+  5. Retrain — paper params seed trial 0 again, then 49 more trials explore from there

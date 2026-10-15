@@ -1,7 +1,7 @@
 # FYP Progress
 
 **Zain Ul Arifeen Sukhera**
-**Last updated: 2026-09-30**
+**Last updated: 2026-10-14**
 
 ---
 
@@ -37,20 +37,104 @@ Steps 1–4 of the CLARITY-AI 2.0 medical pipeline implemented and run:
   - `record_ids` — `(n_beats,)` source record name
   - `r_samples` — `(n_beats,)` int32 R-peak sample position
 
+### Feature extraction — `source/features.py` (early Oct 2026)
+
+40-feature hybrid vector per beat, MLII channel only:
+
+| Group | Features | Count |
+|-------|----------|-------|
+| A — Statistical | mean, std, ptp, skewness, kurtosis, RMS | 6 |
+| B1 — Fiducial intervals | RR_pre, RR_post, QRS_dur, QT_interval, P_dur | 5 |
+| B2 — Fiducial morphology | R/Q/S/T/P amplitudes, R/S ratio, P/R ratio, ST elev | 8 |
+| C — DWT (db4, level 4) | energy + entropy per subband (cA4, cD4–cD1), total energy, cD1 rel energy | 12 |
+| D1 — HRV time + freq | SDNN, RMSSD, LF, HF, LF/HF | 5 |
+| D2 — Non-linear | Poincaré SD1, SD2, SampEn, SD1/SD2 | 4 |
+
+- Rule-based windowed-extrema delineation for Q, S, T, P — no neurokit2 dependency.
+- HRV window: last min(50, available) RR intervals per record.
+- SampEn params: m=2, r=0.2·SD.
+- Parallelised with `ThreadPoolExecutor` (8 workers) per record.
+- Output: `datasets/processed/mit_bih_features.npz` — `X (N,40)`, `y`, `record_ids`, `r_samples`, `feature_names`.
+
+### Train/test splits — `source/split.py` (early Oct 2026)
+
+Two splits implemented and saved:
+
+| Split | File | Train | Test |
+|-------|------|-------|------|
+| Random stratified 80/20 | `split_random.npz` | ~79,432 beats | 19,858 beats |
+| Inter-patient DS1/DS2 | `split_ds1ds2.npz` | DS1 patients | 48,981 beats (DS2) |
+
+DS1/DS2 follows the standard MIT-BIH inter-patient benchmark: no patient appears in both train and test.
+
+### LightGBM training — `source/train.py` (early–mid Oct 2026)
+
+- SMOTE inside imblearn Pipeline — applied per CV fold only, preventing leakage.
+- Optuna TPE, objective = stratified 5-fold macro-F1, 10 trials.
+- Paper's reported hyperparameters (`n_estimators=1450`, `max_depth=11`, `lr=0.05`, `num_leaves=38`, `subsample=0.85`, `colsample_bytree=0.75`) enqueued as trial 0.
+- SQLite checkpointing — interrupted runs resume from last completed trial.
+- Final model refit on full resampled (SMOTE) training data.
+- Both splits trained: `lgbm_random.pkl`, `lgbm_ds1ds2.pkl`.
+
+### Evaluation run 1 — `source/evaluate.py` (2026-10-13)
+
+**Random split (19,858 test beats)**
+
+| Metric | Ours | Paper |
+|--------|------|-------|
+| Accuracy | 0.9960 | 0.989 |
+| Macro-F1 | 0.9875 | ~0.937 |
+| Binary F1 | 0.9928 | 0.928 |
+| OVR AUC | 0.9992 | 0.985 |
+
+Exceeds the paper on every metric. Per-class F1: N=0.998, L=0.997, R=0.998, V=0.991, A=0.954.
+
+**DS1/DS2 split (48,981 test beats)**
+
+| Metric | Ours | Paper | Gap |
+|--------|------|-------|-----|
+| Accuracy | 0.7372 | 0.989 | −0.252 |
+| Macro-F1 | 0.3132 | ~0.937 | −0.624 |
+| Binary F1 | 0.3419 | 0.928 | −0.586 |
+| OVR AUC | 0.7686 | 0.985 | −0.217 |
+
+Per-class F1: N=0.838, L=**0.000**, R=**0.006**, V=0.655, A=0.067. LBBB completely missed; RBBB near-zero.
+
+**Ablation A1→A4 (random split, paper params)**
+
+| Config | Feats | Acc | AnomF1 | Paper Acc |
+|--------|-------|-----|--------|-----------|
+| A1 Statistical | 6 | 0.924 | 0.875 | 0.985 |
+| A2 +Fiducial | 19 | 0.994 | 0.990 | 0.987 |
+| A3 +Wavelet | 31 | 0.995 | 0.991 | 0.988 |
+| A4 +HRV/NonLin | 40 | 0.996 | 0.993 | 0.989 |
+
+A1→A2 jump is +0.070 accuracy in our model vs +0.002 in paper — fiducial amplitude features exploiting patient-identity on random split.
+
+### Root cause analysis + fixes — `source/features.py`, `source/train.py` (2026-10-14)
+
+**Root cause:** Inter-patient generalisation failure. Absolute amplitude features (`fid_r_amp`, `fid_q_amp`, etc.) encode electrode placement and cardiac axis — both patient-specific, not arrhythmia-specific. SMOTE reinforces DS1 patient distributions. CV F1 on DS1 training was 0.985 (no underfitting) — failure is entirely distribution shift, not capacity.
+
+**Fixes implemented:**
+
+1. **Per-record amplitude normalisation** (`features.py` — `process_record()`): each beat divided by `median(|R-amplitudes|)` across the record before feature extraction. All amplitude-derived features (B2 morphology, A statistical, C wavelet energies) become record-relative ratios.
+
+2. **RR interval normalisation** (`features.py` — `process_record()`): `rr_pre` and `rr_post` divided by the record's mean RR before feature extraction — now dimensionless ratios isolating ectopic timing patterns. Feature names updated to `fid_rr_pre_norm` / `fid_rr_post_norm`.
+
+3. **N_TRIALS 10 → 50** (`train.py`): more Optuna trials to explore from the paper-params seed after features change.
+
+4. **DS1/DS2 checkpoints deleted**: old 10 trials trained on unnormalized features — would steer the new search incorrectly. Random split model untouched (already exceeds paper).
+
+**Next:** rebuild features → splits → retrain → re-evaluate.
+
 ---
 
 ## Left to do
 
 ### ML pipeline
 
-- [ ] **Feature extraction** — 42 handcrafted features per channel per beat (RR interval stats, QRS morphology, R/Q/S amplitudes, P-wave, T-wave, interval durations, statistical moments). 84-feature vector for two-channel input.
-- [ ] **Train/test split** — record-level (subject-disjoint); ~80% records train, ~20% test. No beat-level random split.
-- [ ] **SMOTE** — oversample minority classes (L, R, V, A) on the training set only.
-- [ ] **LightGBM experiments:**
-  - Exp 1: 42 features, single-channel (MLII)
-  - Exp 2: 84 features, two-channel concatenation
-  - Exp 3: feature importance → test top 10/20/30 subsets
-  - Tuning: Optuna Bayesian search, objective = CV macro-F1
+- [ ] **Re-run full pipeline** after normalisation fixes: `features.py` → `split.py` → `train.py` → `evaluate.py`
+- [ ] **Verify DS1/DS2 recovery** — LBBB and RBBB F1 should recover from ~0 to meaningful values; target accuracy approaching paper's 0.989
 - [ ] **1D-CNN baseline** — input shape `(N, 2, 720)`
 - [ ] **LSTM baseline** — input shape `(N, 720, 2)`
 - [ ] **KANformer (teacher)** — input shape `(N, 720, 2)`; train on ground-truth labels

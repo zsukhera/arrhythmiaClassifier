@@ -1,0 +1,252 @@
+EVALUATION OUTPUT — INTERPRETATION AND ANALYSIS
+================================================
+Generated: 2026-10-14
+Author: Zain Ul Arifeen Sukhera
+================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — RANDOM SPLIT (19,858 test beats)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BEHAVIOR
+--------
+Our model exceeds the paper on every single metric:
+
+  Accuracy  : 0.9960  vs paper 0.989   (+0.007)
+  Macro-F1  : 0.9875  vs paper ~0.937  (+0.050)
+  OVR AUC   : 0.9992  vs paper 0.985   (+0.014)
+  Binary F1 : 0.9928  vs paper 0.928   (+0.065)
+
+Per-class F1 scores are uniformly high. Even APC (the rarest class,
+only 509 test beats) achieves F1=0.954. No class is being missed.
+
+POTENTIAL EXPLANATION
+---------------------
+In a random 80/20 split, beats from the SAME patient appear in both
+training and test sets. This means the model sees the patient's own
+amplitude range, baseline wander pattern, and heart rate during
+training. When it sees that patient again at test time, recognition
+is easy.
+
+In other words: this split is "easy" because the model is partially
+learning who the patient is, and patient identity is a strong
+predictor of future beats from the same patient. The model exploits
+absolute amplitude features (fid_r_amp, fid_q_amp, etc.) which are
+highly patient-specific. On this split, that leakage helps rather
+than hurts.
+
+Our result exceeding the paper is not cause for concern — it is
+expected. It confirms the feature pipeline and SMOTE+LightGBM
+setup are correctly implemented. The CV F1 (0.9864) closely
+matches the held-out test F1 (0.9875), so the model is not
+overfitting in the traditional sense — it is simply exploiting
+patient-identity information that this split exposes.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — DS1/DS2 SPLIT (48,981 test beats)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BEHAVIOR
+--------
+Our model catastrophically underperforms the paper on this split:
+
+  Accuracy  : 0.7337  vs paper 0.989   (-0.255)
+  Macro-F1  : 0.3121  vs paper ~0.937  (-0.625)
+  OVR AUC   : 0.7647  vs paper 0.985   (-0.220)
+  Binary F1 : 0.3394  vs paper 0.928   (-0.589)
+
+Per-class breakdown reveals the core of the problem:
+
+  N  (Normal) : F1 = 0.835  — poor but functional
+  L  (LBBB)   : F1 = 0.000  — completely missed
+  R  (RBBB)   : F1 = 0.006  — near-zero
+  V  (PVC)    : F1 = 0.652  — partially working
+  A  (APC)    : F1 = 0.067  — near-zero
+
+LBBB is a zero. RBBB is effectively a zero. The model predicts
+almost everything as Normal or PVC.
+
+There is also a crucial contradiction: the CV F1 on the DS1
+training set is 0.9856 — nearly identical to the random split.
+The model is NOT underfitting during training. It collapses
+entirely at test time. This combination (high train CV + low
+test) is the classic signature of distribution shift, not
+capacity failure.
+
+POTENTIAL EXPLANATION
+---------------------
+This is an inter-patient generalisation failure. The DS1/DS2
+split is the clinically correct way to evaluate: DS1 contains
+one group of patients for training, DS2 contains a completely
+different group for testing. No patient appears in both.
+
+Three mechanisms combine to cause this failure:
+
+1. ABSOLUTE AMPLITUDE FEATURES
+   Features like fid_r_amp (R-wave peak amplitude), fid_q_amp
+   (Q-wave amplitude), fid_s_amp (S-wave amplitude), and the
+   wavelet energy bands all capture the absolute voltage scale
+   of the signal. This scale is determined by electrode placement,
+   body composition, and the patient's cardiac axis — none of
+   which are arrhythmia-specific. When the model trains on DS1
+   patients, it learns that "LBBB looks like a tall broad QRS
+   at ~1.2 mV". DS2 patients may have LBBB with broad QRS at
+   ~0.6 mV (different electrode placement). The model never
+   saw that and classifies it as Normal.
+
+2. LBBB AND RBBB ARE MORPHOLOGY-DEPENDENT
+   Left Bundle Branch Block and Right Bundle Branch Block are
+   diagnosed by the SHAPE of the QRS complex (widened, notched,
+   with specific lead patterns) — not by amplitude alone. The
+   exact morphological signature varies significantly between
+   patients depending on the degree of block, co-existing
+   conditions, and lead placement. When the amplitude scale
+   is allowed to encode patient identity, the model cannot
+   distinguish morphology from identity across the patient
+   boundary.
+
+3. SMOTE REINFORCES PATIENT-SPECIFIC DISTRIBUTIONS
+   SMOTE synthesises new minority-class examples by interpolating
+   between existing ones. If all LBBB training examples come from
+   DS1 patients with a specific amplitude range, SMOTE creates
+   more synthetic LBBB beats within that same amplitude range.
+   It does not help generalise to the different amplitude scale
+   of DS2 patients — it doubles down on DS1's distribution.
+
+PVC (V) partially works (F1=0.652) because PVC is characterised
+by a very wide, bizarre-looking beat that disrupts the rhythm
+strongly enough to be detected even across patients. Its signal
+is harder to mask by amplitude differences alone.
+
+Normal beats (F1=0.835) work acceptably because they are the
+majority class and the model defaults to predicting Normal when
+uncertain, which is correct most of the time.
+
+THE FIX
+-------
+Normalise each beat's amplitude features relative to the
+record's own median R-amplitude before feature extraction.
+This makes the features record-relative ("the R-wave is 1.2x
+the record median") instead of absolute ("the R-wave is 1.2 mV").
+Similarly, normalise RR intervals to the patient's mean RR
+instead of using raw millisecond values. These two changes
+remove patient identity from the feature vector, forcing the
+model to learn arrhythmia morphology rather than patient
+signatures.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — ABLATION A1 → A4 (Random Split, Paper Params)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BEHAVIOR
+--------
+                         Ours                  Paper
+  Config           Feats  Acc   AnomF1   Acc   AnomF1
+  A1 Statistical     6   0.924   0.875   0.985   0.860
+  A2 +Fiducial      19   0.994   0.990   0.987   0.901
+  A3 +Wavelet       31   0.995   0.991   0.988   0.921
+  A4 +HRV/NonLin    40   0.996   0.993   0.989   0.928
+
+Two distinct patterns:
+
+  A1: We UNDERPERFORM the paper (0.924 vs 0.985, gap of -0.061)
+  A2-A4: We SIGNIFICANTLY OUTPERFORM the paper by large margins
+
+The jump from A1 to A2 in our implementation is enormous:
+  +0.070 accuracy (0.924 → 0.994)
+  +0.115 anomaly F1 (0.875 → 0.990)
+
+In the paper, the same jump is only:
+  +0.002 accuracy (0.985 → 0.987)
+  +0.041 anomaly F1 (0.860 → 0.901)
+
+POTENTIAL EXPLANATION
+---------------------
+A1 UNDERPERFORMANCE (6 statistical features)
+The 6 statistical features are: mean, std, skew, kurtosis, energy,
+and zero-crossing rate of the raw beat signal. These are very
+coarse global descriptors. The paper reports 0.985 accuracy with
+just these 6 features — which is actually very high. This suggests
+either:
+  (a) The paper's definition of "statistical features" includes
+      slightly different or more discriminative quantities than ours
+  (b) The paper's preprocessing pipeline differs in a way that makes
+      the raw signal statistics more informative
+  (c) The paper may be using a different feature set labelled
+      "statistical" that includes timing information our A1 omits
+
+Our A1 hitting 0.924 is not a disaster — it is reasonable for 6
+features — but the gap to the paper (0.061) is meaningful and
+suggests our statistical features are a weaker baseline than the
+paper's.
+
+A2 LARGE JUMP — FIDUCIAL FEATURES DOMINATE
+Adding fiducial features (R amplitude, Q amplitude, S amplitude,
+P-wave area, T-wave area, QRS width, Q-T interval, PR interval,
+etc.) in our implementation gives an enormous boost. These features
+are very discriminative on the random split because:
+  - They directly encode QRS morphology (which differs by class)
+  - They also encode patient-specific amplitude (which is
+    consistent within a patient across the random split)
+
+Both effects help on random split. The model exploits absolute
+amplitude as a strong class discriminator within the patient
+cohort it has already seen. This is why our jump (+0.070) is
+so much larger than the paper's (+0.002) — the paper's model
+either does not have this patient-identity shortcut available,
+or uses normalised fiducial features that force it to learn
+true morphology.
+
+A3 AND A4 — MARGINAL GAINS
+Wavelet features (A3, 31 total) and HRV/non-linear features
+(A4, 40 total) add only tiny increments above A2:
+  A3: +0.001 accuracy, +0.001 anomaly F1
+  A4: +0.001 accuracy, +0.002 anomaly F1
+
+This means on the random split, once you have fiducial features,
+wavelet and HRV features add almost nothing. The model is already
+at ceiling. On the DS1/DS2 split (not shown in ablation), wavelet
+and HRV features would likely add more value if the amplitude
+normalisation fix is applied — because they carry morphology
+information that is less patient-specific.
+
+KEY INSIGHT FROM ABLATION
+The ablation exposes a contradiction: our model achieves ceiling
+performance on the random split (exceeds paper significantly) but
+collapses on DS1/DS2. The cause is the same: fiducial amplitude
+features are too powerful on random split (because patient identity
+leaks), and those same features cause failure on DS1/DS2 (because
+a different patient's amplitudes are unrecognised). The ablation
+confirms that these features are load-bearing for our results —
+removing them (A1) drops us to 0.924, adding them (A2) jumps us
+to 0.994. The fix must make these features patient-relative,
+not remove them.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — OVERALL SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The implementation is technically correct (pipeline runs, metrics
+compute, CV scores match held-out for the random split). The failure
+is a feature engineering problem, not a model or code problem.
+
+The single diagnosis: absolute amplitude features encode patient
+identity. On random split this helps (patient seen in training).
+On DS1/DS2 it destroys generalisation (new patient, unknown scale).
+
+Priority order for fixing:
+  1. Normalise beat amplitude by record median R-amplitude
+     (makes all amplitude features record-relative)
+  2. Normalise RR intervals by record mean RR
+     (removes heart rate as a confound)
+  3. Rebuild features, splits, retrain DS1/DS2
+  4. Optionally raise N_TRIALS from 10 to 50 for better tuning
+
+Expected outcome after fix:
+  - DS1/DS2 accuracy should rise substantially toward paper's 0.989
+  - LBBB and RBBB F1 should recover from ~0.000 to meaningful values
+  - Random split accuracy will remain near ceiling (~0.996)
