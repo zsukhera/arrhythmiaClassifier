@@ -1836,3 +1836,17 @@ LBBB and RBBB F1 should recover from ~0.000 to meaningful values. Random split a
 will remain near ceiling (~0.996) since it already exceeds the paper.
 
 ─────────────────────────────────────────────────────────────────────────────────────
+
+16-10-2026
+There has been a orchestration of pathetic accuracies for the past 2-3 days
+We also need to try De Chazal's paper    
+    "The most important difference: De Chazal used AAMI classes, not the N/L/R/V/A
+    scheme. In AAMI, L (LBBB) and R (RBBB) are both mapped into class N (normal-like),
+     because AAMI considers bundle branch blocks as supraventricular. So de Chazal
+    never had to classify LBBB vs RBBB as separate classes — which is exactly why your
+     DS1/DS2 LBBB/RBBB recall is so poor. You're asking the inter-patient split to do
+    something de Chazal's original setup never attempted.
+
+    The paper you're re-implementing (CLARITY-AI 2.0) adopted the N/L/R/V/A scheme but
+     likely used a random split, so they never exposed this problem.
+     "
