@@ -342,6 +342,11 @@ def process_record(
 
     for pos in range(n):
         beat  = segments[sorted_global[pos], 0, :] / scale   # amplitude-normalised
+        # If the QRS complex is inverted (negative deflection at R_IDX), flip the beat so
+        # that all fiducial detectors — which assume a positive R peak — operate correctly.
+        # Record 207 L beats are a known example of inverted-QRS LBBB in Lead II.
+        if float(beat[R_IDX]) < 0:
+            beat = -beat
 
         rr_pre  = rr_ms[pos - 1] if pos > 0     else np.nan
         rr_post = rr_ms[pos]     if pos < n - 1 else np.nan
