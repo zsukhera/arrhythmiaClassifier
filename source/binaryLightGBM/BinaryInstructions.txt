@@ -1,0 +1,225 @@
+================================================================================
+BINARY LIGHTGBM — INSTRUCTIONS & DESIGN REFERENCE
+================================================================================
+Zain Ul Arifeen Sukhera · 2026-27
+Generated: 2026-10-18
+================================================================================
+
+
+OVERVIEW
+--------
+This directory contains a dedicated binary classifier for MIT-BIH ECG arrhythmia
+detection: Normal (0) vs Anomaly (1), where Anomaly = {L (LBBB), R (RBBB),
+V (PVC), A (APC)}.
+
+The 5-class model (source/train.py) is stuck at ~73-77% accuracy on the
+DS1/DS2 inter-patient split because LBBB (F1=0.000) and RBBB (F1=0.004) are
+near-zero cross-patient. A dedicated binary model should do substantially
+better because it only needs to detect "something is abnormal" rather than
+distinguishing LBBB from RBBB, which requires patient-specific morphology.
+
+The paper (clarityBase.txt §8.1) reports binary AUC=0.985, F1=0.928 — these
+are the targets.
+
+
+FILES
+-----
+  train_binary.py     — trains binary LightGBM on random + DS1/DS2 splits
+  evaluate_binary.py  — evaluates and compares models, saves plots
+  BinaryInstructions.txt — this file
+
+
+HOW TO RUN
+----------
+1. Activate the virtual environment:
+
+       source /home/sirajmunir/fyp/.venv/bin/activate
+
+2. Navigate to this directory:
+
+       cd /home/sirajmunir/fyp/source/binaryLightGBM
+
+3. Train (runs both random and DS1/DS2 splits, ~50 Optuna trials each):
+
+       python train_binary.py
+
+   The run can be interrupted at any time. Each completed Optuna trial is
+   saved to SQLite automatically. Rerunning the script resumes from the
+   last completed trial.
+
+4. Evaluate (compare paper / 5-class-collapsed / dedicated binary model):
+
+       python evaluate_binary.py
+
+
+PREREQUISITES
+-------------
+The following files must already exist (produced by the upstream pipeline):
+
+  datasets/processed/split_random.npz    — from source/split.py
+  datasets/processed/split_ds1ds2.npz    — from source/split.py
+  models/lgbm_ds1ds2.pkl                 — from source/train.py (for comparison)
+  models/lgbm_random.pkl                 — from source/train.py (for comparison)
+
+The feature files (mit_bih_features.npz) are NOT read directly — the split
+files already contain the feature matrices (X_train, X_test).
+
+
+OUTPUTS
+-------
+  models/lgbm_binary_random.pkl
+  models/lgbm_binary_ds1ds2.pkl
+  models/lgbm_binary_random_optuna.json
+  models/lgbm_binary_ds1ds2_optuna.json
+
+  models/checkpoints/lgbm_binary_random_optuna.db     (Optuna SQLite)
+  models/checkpoints/lgbm_binary_ds1ds2_optuna.db     (Optuna SQLite)
+  models/checkpoints/lgbm_binary_random_search_complete.json
+  models/checkpoints/lgbm_binary_ds1ds2_search_complete.json
+
+  results/binary/cm_binary_model_random.png
+  results/binary/cm_binary_model_ds1ds2.png
+  results/binary/cm_5class_collapsed_random.png
+  results/binary/cm_5class_collapsed_ds1ds2.png
+  results/binary/roc_random.png
+  results/binary/roc_ds1ds2.png
+
+
+GPU / DEVICE SELECTION
+----------------------
+The script probes for GPU support in this order: cuda → gpu → cpu.
+
+At the time of writing, the standard PyPI LightGBM wheel is NOT compiled with
+CUDA or OpenCL GPU support. The probe will print a warning and fall back to CPU
+automatically — this is expected and not an error.
+
+To enable GPU acceleration:
+  - Run source/setup_gpu.sh to rebuild LightGBM with CUDA enabled
+  - Or set the environment variable before running:
+        export LGBM_DEVICE=cuda   # force CUDA
+        export LGBM_DEVICE=gpu    # force OpenCL
+        export LGBM_DEVICE=cpu    # force CPU
+
+
+DESIGN DECISIONS
+----------------
+
+1. LABELS
+   N → 0 (Normal)
+   L, R, V, A → 1 (Anomaly)
+
+   DS1 class ratio: N=38,086  Anomaly=12,221  (3.12:1)
+   DS2 class ratio: N=36,427  Anomaly=12,554  (2.90:1)
+
+2. LIGHTGBM OBJECTIVE
+   objective='binary' (binary cross-entropy / log-loss).
+   This is more appropriate than collapsing a multiclass softmax output
+   because the loss function is directly aligned with the binary task.
+
+3. CLASS IMBALANCE
+   SMOTE is applied inside an imblearn Pipeline, independently per CV fold
+   (consistent with the 5-class train.py, clarityBase.txt §9.2).
+   SMOTE over-samples the minority Anomaly class to match Normal in each fold.
+   scale_pos_weight is not used (would double-count with SMOTE).
+
+4. HYPERPARAMETER SEARCH
+   Starting point: paper's reported final hyperparameters (clarityBase.txt §6)
+   are enqueued as Optuna trial 0.
+
+   Paper params:
+     n_estimators      1450   (search range: 500–2000)
+     max_depth         11     (search range: 5–15)
+     learning_rate     0.05   (search range: 0.01–0.2, log-scale)
+     num_leaves        38     (search range: 20–50)
+     subsample         0.85   (search range: 0.6–1.0)
+     colsample_bytree  0.75   (search range: 0.6–1.0)
+
+   Extended binary search (new vs 5-class train.py):
+     min_child_samples  20    (search range: 10–100)
+       → Prevents a leaf from fitting fewer than N samples.
+         Larger values regularise more; important for cross-patient
+         generalisation on DS1/DS2.
+     reg_alpha          0.0   (search range: 1e-8–5.0, log-scale)
+       → L1 regularisation on leaf weights.
+     reg_lambda         0.0   (search range: 1e-8–5.0, log-scale)
+       → L2 regularisation on leaf weights.
+
+5. OPTUNA OBJECTIVE
+   Optimises mean anomaly-class F1 (pos_label=1) over 5-fold stratified CV.
+   The 5-class train.py used macro-F1; binary uses anomaly-class F1 because:
+     - It directly measures what we want to maximise
+     - It is insensitive to Normal class performance (which is always high)
+     - Macro-F1 in binary is dominated by the majority Normal class
+
+6. FINAL REFIT
+   After Optuna, the best params are used to train a final model on the full
+   training set with SMOTE (not inside a pipeline — SMOTE applied once to
+   the full training set before fitting the final model).
+
+7. CHECKPOINTING
+   Optuna stores every completed trial in a SQLite database.
+   If training is interrupted, rerunning the script resumes automatically.
+   N_TRIALS = 50 means 50 TOTAL trials; if 30 are already done, only 20 more
+   are run on resume.
+
+
+WHY BINARY SHOULD OUTPERFORM 5-CLASS COLLAPSED ON DS1/DS2
+----------------------------------------------------------
+The 5-class model collapses to binary as:
+  anomaly_score = P(L) + P(R) + P(V) + P(A)
+
+This is a post-hoc aggregation of a model that failed to learn L and R
+cross-patient (F1≈0). Collapsing near-zero probabilities still gives a
+near-zero anomaly score for LBBB and RBBB beats from DS2 patients.
+
+A dedicated binary model learns a single decision boundary between Normal
+and Anomaly directly. It does not need to distinguish LBBB from RBBB from
+PVC — it only needs to detect "this beat looks unusual." Even if the exact
+morphological subtype varies across patients, wide QRS, ectopic timing,
+and abnormal waveform energy are signals that transcend patient identity
+more readily than the fine-grained class distinctions.
+
+Expected improvement on DS1/DS2:
+  Current (5-class collapsed): Acc≈0.74  Binary F1≈0.34  AUC≈0.77
+  Binary model target:         Acc≈0.85+ Binary F1≈0.75+ AUC≈0.90+
+  Paper reported (their split): Acc=0.989 Binary F1=0.928 AUC=0.985
+
+The paper's numbers use a random (intra-patient) split, which inflates scores
+due to patient identity leakage. The DS1/DS2 inter-patient numbers will be
+lower than the paper's, but should be substantially better than the current
+5-class approach.
+
+
+EVALUATION OUTPUT GUIDE
+-----------------------
+evaluate_binary.py prints a comparison table:
+
+  Paper (clarityBase.txt §8.1):      Acc=0.989  P=0.931  R=0.925  F1=0.928  AUC=0.985
+  5-class model (collapsed, ds1ds2): Acc=?       P=?      R=?      F1=?      AUC=?
+  Binary model  (dedicated, ds1ds2): Acc=?       P=?      R=?      F1=?      AUC=?
+
+The class-origin recall breakdown shows which original arrhythmia types are
+still being missed by the binary model (e.g. if RBBB recall is still low,
+it means the model still struggles with RBBB even in binary mode).
+
+The optimal-threshold section finds the decision threshold that maximises
+anomaly-class F1 on the test set. This is informational — in a real
+deployment, the threshold should be tuned on a held-out validation set,
+not the test set.
+
+
+NOTES ON DS1/DS2 SPLIT
+-----------------------
+The DS1/DS2 split follows de Chazal et al. (2004): no patient appears in
+both train and test. It is the clinically correct evaluation protocol for
+a deployable arrhythmia classifier.
+
+DS1 records (train): 101, 106, 108, 109, 112, 114, 115, 116, 118, 119,
+                     122, 124, 201, 203, 205, 207, 208, 209, 215, 220,
+                     223, 230
+
+DS2 records (test):  100, 103, 105, 111, 113, 117, 121, 123, 200, 202,
+                     210, 212, 213, 214, 219, 221, 222, 228, 231, 232,
+                     233, 234
+
+================================================================================
