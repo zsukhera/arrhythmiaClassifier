@@ -34,6 +34,7 @@
 
 # %%
 
+import contextlib
 import json
 import os
 import pickle
@@ -81,11 +82,13 @@ PAPER_PARAMS = {
 
 # Extended starting point for binary: adds LightGBM defaults for the
 # regularisation params that are new to this search space.
+# reg_alpha/reg_lambda use 1e-8 (not 0.0) because suggest_float(..., log=True)
+# requires strictly positive values; 0.0 would cause trial 0 to FAIL.
 PAPER_PARAMS_BINARY = {
     **PAPER_PARAMS,
     "min_child_samples": 20,
-    "reg_alpha":         0.0,
-    "reg_lambda":        0.0,
+    "reg_alpha":         1e-8,
+    "reg_lambda":        1e-8,
 }
 
 # Custom scorer: F1 for the anomaly class (pos_label=1).
@@ -93,6 +96,24 @@ PAPER_PARAMS_BINARY = {
 ANOMALY_F1_SCORER = make_scorer(f1_score, pos_label=1, average="binary", zero_division=0)
 
 # %%
+
+
+@contextlib.contextmanager
+def _suppress_c_stderr():
+    """Redirect C-level fd-2 to /dev/null temporarily.
+
+    LightGBM prints [Fatal] messages directly via C, bypassing Python's
+    sys.stderr, so only an fd-level redirect can suppress them.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_fd   = os.dup(2)
+    os.dup2(devnull_fd, 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(devnull_fd)
+        os.close(saved_fd)
 
 
 def _probe_device() -> str:
@@ -121,8 +142,9 @@ def _probe_device() -> str:
 
     for dev in ("gpu", "cuda"):
         try:
-            LGBMClassifier(device=dev, n_estimators=5, verbose=-1,
-                           objective="binary").fit(X_t, y_t)
+            with _suppress_c_stderr():
+                LGBMClassifier(device=dev, n_estimators=5, verbose=-1,
+                               objective="binary").fit(X_t, y_t)
             print(f"[device] LightGBM will use device='{dev}'")
             return dev
         except Exception as exc:
@@ -218,13 +240,29 @@ def get_or_create_study(split_name: str) -> optuna.Study:
 
     print(f"\n  Optuna checkpoint: {db_path}")
 
-    return optuna.create_study(
+    study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=SEED),
         study_name=study_name,
         storage=storage_url,
         load_if_exists=True,
     )
+
+    # Mark any trials stuck in RUNNING state (from a previous crash) as FAIL
+    # so they don't sit indefinitely in the checkpoint and confuse reporting.
+    stuck = [t for t in study.trials
+             if t.state == optuna.trial.TrialState.RUNNING]
+    if stuck:
+        print(f"  Cleaning up {len(stuck)} stuck RUNNING trial(s) → FAIL")
+        for t in stuck:
+            try:
+                study._storage.set_trial_state_values(
+                    t._trial_id, state=optuna.trial.TrialState.FAIL
+                )
+            except Exception:
+                pass  # best-effort; not fatal if it fails
+
+    return study
 
 
 # %%
