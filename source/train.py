@@ -48,6 +48,7 @@ from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
 from lightgbm import LGBMClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from tqdm import tqdm
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -141,7 +142,7 @@ def _probe_device() -> str:
 
 DEVICE = _probe_device()
 
-N_TRIALS = 1
+N_TRIALS = 100
 N_CV_FOLDS = 5
 SEED = 42
 
@@ -313,6 +314,37 @@ def get_or_create_study(
     )
 
     return study
+
+
+def checkpoint_callback(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+) -> None:
+    """
+    Report checkpoint progress after each trial.
+
+    Optuna calls this after the trial has been written to SQLite,
+    so the count reflects what is actually saved on disk.
+    """
+
+    saved = len(
+        study.get_trials(
+            deepcopy=False,
+            states=(optuna.trial.TrialState.COMPLETE,),
+        )
+    )
+
+    if trial.state == optuna.trial.TrialState.COMPLETE:
+        status = f"macro-F1 = {trial.value:.4f}"
+    else:
+        status = f"state = {trial.state.name} (not counted)"
+
+    # tqdm.write keeps the Optuna progress bar intact.
+    tqdm.write(
+        f"  ✓ Trial {trial.number} saved to checkpoint "
+        f"[{status}] — "
+        f"{saved}/{N_TRIALS} completed trials on disk"
+    )
 
 
 # %%
@@ -495,6 +527,8 @@ def train_and_save(
                 ),
 
                 n_trials=remaining_trials,
+
+                callbacks=[checkpoint_callback],
 
                 show_progress_bar=True,
             )

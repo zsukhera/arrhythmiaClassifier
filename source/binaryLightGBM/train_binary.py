@@ -311,7 +311,7 @@ def train_and_save(split_name: str, split_path: Path) -> None:
     else:
         print("\n  ✓ Existing checkpoint found — resuming Optuna study.")
 
-    remaining = max(0, N_TRIALS - completed)
+    remaining = max(0, N_TRIALS - len(study.trials))
 
     if remaining > 0:
         print(f"\n  Running {remaining} remaining Optuna trials "
