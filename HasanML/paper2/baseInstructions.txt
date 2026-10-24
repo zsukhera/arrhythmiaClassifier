@@ -1,0 +1,228 @@
+================================================================================
+CLAUDE CODE PROMPT: Replicate Yakut & Dogru Bolat (2020) 5-class AAMI heartbeat
+classification on MIT-BIH using morphology features + Logistic Regression
+================================================================================
+
+Paste everything below this line into Claude Code.
+--------------------------------------------------------------------------------
+
+## Goal
+
+Replicate:
+
+  O. Yakut and E. Dogru Bolat, "An efficient arrhythmic heartbeat
+  classification method using ECG morphology based features," Euroasia J.
+  Math., Eng., Nat. Med. Sci., vol. 7, no. 13, pp. 200-212, 2020,
+  doi: 10.38065/euroasiaorg.403.
+
+The paper extracts 57 morphology/RR features per heartbeat, optionally reduces
+them to 20 with SelectKBest (f_classif), and classifies beats into the 5 AAMI
+classes (N, S, V, F, Q) with scikit-learn Logistic Regression (LR), LDA, SVM
+and MLP, all with DEFAULT hyperparameters. LR is the proposed method.
+
+Many implementation details are only in the first author's PhD thesis
+(Yakut, 2018, Kocaeli University), which we do not have. Wherever this prompt
+says "ASSUMPTION", implement the stated default, make it configurable, and
+list it in the README.
+
+## Target results to compare against
+
+Table 3 (57 features), TEST set:
+| Method | Accuracy | Sensitivity | Specificity | F1      |
+|--------|----------|-------------|-------------|---------|
+| LR     | 99.801 % | 99.503 %    | 99.876 %    | 99.503 % |
+| LDA    | 99.339 % | 98.346 %    | 99.587 %    | 98.963 % |
+| SVM    | 98.806 % | 97.015 %    | 99.254 %    | 98.122 % |
+| MLP    | 98.623 % | 96.557 %    | 99.139 %    | 97.831 % |
+
+Table 4 (20 selected features), TEST set:
+| Method | Accuracy | Sensitivity | Specificity | F1      |
+|--------|----------|-------------|-------------|---------|
+| LR     | 99.766 % | 99.416 %    | 99.854 %    | 99.416 % |
+| LDA    | 99.697 % | 99.243 %    | 99.811 %    | 99.243 % |
+| SVM    | 99.552 % | 98.880 %    | 99.720 %    | 99.298 % |
+| MLP    | 98.776 % | 96.939 %    | 99.235 %    | 98.074 % |
+
+Reported ROC AUC: 57 features LR 99.61, LDA 99.31, SVM 99.33, MLP 99.07;
+20 features LR 99.58, LDA 99.32, SVM 99.31, MLP 99.08.
+
+Do not tune toward these numbers on the test set. They are for comparison.
+
+## IMPORTANT: how the paper's metrics appear to be computed (verify this)
+
+The paper's numbers are consistent with MICRO-averaged one-vs-rest metrics,
+not plain multiclass accuracy. Let e = multiclass error rate and K = 5:
+  - "Sensitivity" = "F1" = micro-recall = plain multiclass accuracy = 1 - e
+  - "Accuracy"    = mean one-vs-rest binary accuracy = 1 - 2e/K
+  - "Specificity" = micro-specificity = 1 - e/(K-1)
+Check: LR 20 features, e = 0.584 % -> 1 - 2(0.00584)/5 = 99.766 %,
+1 - 0.00584/4 = 99.854 %. Both match the paper exactly. Same for 57 features
+(e = 0.497 % -> 99.801 %, 99.876 %).
+So the paper's true multiclass accuracy for LR is about 99.42 % (20 features)
+and 99.50 % (57 features). Implement ALL of the following and report them
+side by side: plain multiclass accuracy, OvR-averaged accuracy, micro / macro /
+weighted sensitivity, specificity, precision, F1, per-class sensitivity and
+PPV for N, S, V, F, Q, the full 5x5 confusion matrix, and the majority-class
+("predict all N") baseline accuracy. Confirm or refute the micro-averaging
+hypothesis in the README.
+
+## Data
+
+- MIT-BIH Arrhythmia Database (PhysioNet `mitdb`), 360 Hz, 11-bit, 48 records.
+  Download with `wfdb` and cache in `data/mitdb/`.
+- Lead: MLII (verify per record via `sig_name`; record 114 has leads swapped).
+- Exclude the 4 paced records (102, 104, 107, 217) -> 44 records. ASSUMPTION:
+  inferred because the paper's Q class has only 15 beats.
+- Beat positions: R peaks from the `atr` annotation file (the paper uses the
+  annotations, not a QRS detector).
+
+### Label mapping (follow the paper's Table 1 exactly)
+
+| AAMI | MIT-BIH symbols (paper) | Total | Train | Test  |
+|------|-------------------------|-------|-------|-------|
+| N    | N, L, R, e, j           | 90083 | 45845 | 44238 |
+| S    | A, a, J, x              | 2972  | 1000  | 1972  |
+| V    | V, !, E                 | 7480  | 4260  | 3220  |
+| F    | F                       | 802   | 414   | 388   |
+| Q    | Q                       | 15    | 8     | 7     |
+| All  |                         |101352 | 51527 | 49825 |
+
+Note this differs from the standard AAMI mapping (S includes 'S' not 'x';
+V excludes '!'; Q includes '/', 'f'). Implement the paper's mapping as the
+default and the standard AAMI EC57 mapping as `--label-map aami`.
+Drop beats whose 256-sample window runs past the record edges, and log every
+beat dropped and why. Print a table of your counts next to the paper's.
+
+## Split
+
+The paper does not name its split; its Figure 1 is not legible in available
+text. Its train/test sizes (51527 / 49825) closely match the de Chazal et al.
+(2004) inter-patient split, so implement THREE protocols and report all three:
+
+A. Inter-patient (default), de Chazal DS1/DS2:
+   DS1 (train): 101, 106, 108, 109, 112, 114, 115, 116, 118, 119, 122, 124,
+                201, 203, 205, 207, 208, 209, 215, 220, 223, 230
+   DS2 (test):  100, 103, 105, 111, 113, 117, 121, 123, 200, 202, 210, 212,
+                213, 214, 219, 221, 222, 228, 231, 232, 233, 234
+B. Intra-patient: beats pooled from all 44 records, stratified random split
+   reproducing the paper's per-class train/test counts as closely as possible
+   (fixed seed).
+C. 5-fold stratified cross-validation over all beats (the paper also says the
+   classifiers were fed "using the five-fold cross-validation technique").
+
+For each protocol, print the per-class counts versus the paper's Table 1, and
+state in the README which protocol best matches the paper's counts AND results.
+Expectation to test: plain-accuracy ~99.4 % for 5-class LR is typical of
+intra-patient (beat-level random) splits and far above published inter-patient
+results; S-class sensitivity under DS1/DS2 should be much lower.
+
+## Preprocessing
+
+- Baseline wander removal (paper: "lowpass elliptic IIR filter ... does not pass
+  noise below 1 Hz"): estimate the baseline with a low-pass elliptic IIR filter
+  (cutoff 1 Hz) and SUBTRACT it from the raw signal. ASSUMPTIONS: order 4,
+  passband ripple 0.1 dB, stopband attenuation 40 dB, zero-phase
+  (`scipy.signal.ellip` + `sosfiltfilt`). Make configurable. Save a plot of
+  record 101 before/after (paper Figure 2).
+- Beat window: 127 samples before the R peak + R + 128 samples after = 256
+  samples.
+
+## Features (57 total, paper Table 2)
+
+Implement fiducial-point detection inside fixed sub-windows of the 256-sample
+beat window (paper Figure 3). ASSUMPTION for window boundaries relative to R
+(index 127), in ms, configurable:
+  P wave:  R-250 to R-80   -> P peak, P onset (P1), P offset (P2)
+  Q:       R-80  to R      -> Q point (local min before R), Q onset (Q1)
+  R:       R peak (annotation, refine to local max within +/-10 samples)
+  S:       R to R+80       -> S point (local min after R), S offset (S2)
+  T wave:  R+100 to R+350  -> T peak, T onset (T1), T offset (T2)
+  (window will be clipped to the 256-sample beat window; R+350 ms exceeds it,
+  so clip T search to the window end and log it)
+Use simple, documented rules for onsets/offsets (e.g. slope-threshold or
+first point within X % of the local baseline).
+
+Features 1-35 as named in Table 2 (temporal differences in ms, amplitudes in
+mV, areas, angles in degrees):
+ 1 P width        2 PR             3 P1R            4 P2R
+ 5 PR interval    6 PQ             7 PS interval    8 PT
+ 9 QR            10 QS            11 QT interval   12 QRS interval
+13 RS            14 RT1           15 RT            16 RT2
+17 ST interval   18 T width       19 P amplitude   20 PR amplitude
+21 QR amplitude  22 R amplitude   23 RS amplitude  24 T amplitude
+25 RT amplitude  26 QR area       27 RS area       28 angle Q1-Q-R
+29 angle Q-R-S   30 angle R-S-S2  31 Pre-RR        32 Post-RR
+33 RR average    34 RR local avg  35 "IR time information"
+RR features (follow de Chazal 2004 and the paper):
+  - Pre-RR: interval to the previous beat; Post-RR: to the next beat.
+  - RR average: mean RR over the whole record (same value for every beat in a
+    record).
+  - RR local average: mean of 10 surrounding RR intervals (5 before, 5 after).
+  - Feature 35 "IR time information": unspecified. ASSUMPTION: time of the R
+    peak within the record in seconds; ALSO run an ablation without it, since a
+    record-position feature can leak record identity.
+Features 36-47: amplitudes of the 12 fiducial points (P1, P, P2, Q1, Q, R, S,
+S2, T1, T, T2, plus baseline level at window start). Features 48-57: 10
+intervals between consecutive fiducial points. ASSUMPTION: the paper does not
+define these exactly; document your choice.
+
+Angles: compute in a physical plane (time in s, amplitude in mV) and document
+the scaling, since the angle depends on it.
+
+Normalization: min-max to [0,1]. ASSUMPTION: fit the scaler on the TRAINING set
+only. Also run the paper-faithful variant (scaler fit on all data before the
+split, as the text implies) and report the difference.
+
+## Feature selection
+
+- `SelectKBest(f_classif, k=20)`. Fit on TRAINING data only (default) and,
+  as an ablation, on all data. The paper kept features with F-score > 1000;
+  report the F-scores and which 20 features were kept, and plot them (paper
+  Figure 5).
+
+## Classifiers
+
+scikit-learn with DEFAULT hyperparameters, as in the paper:
+`LogisticRegression()`, `LinearDiscriminantAnalysis()`, `SVC(probability=True)`
+(probability only for ROC), `MLPClassifier()`. Record the sklearn version.
+If LogisticRegression emits a ConvergenceWarning, report results both with the
+default `max_iter=100` and with `max_iter=5000`.
+Run each with the 57-feature and 20-feature sets. Fixed random_state for
+everything that accepts one; repeat stochastic models (MLP) over 5 seeds.
+
+## Deliverables
+
+- `src/` modules: `data.py` (download, labels, splits), `preprocess.py`,
+  `fiducials.py`, `features.py`, `select.py`, `models.py`, `metrics.py`,
+  `run_experiment.py` (argparse CLI).
+- `configs/default.yaml` with every parameter and assumption.
+- `results/`:
+  - `counts_vs_paper.md` (Table 1 comparison for each split protocol)
+  - `results_<protocol>_<nfeat>.csv` and a combined `results_summary.md`
+    with our metrics (all averaging schemes) next to the paper's Tables 3/4
+  - confusion matrices (PNG) and ROC curves (paper Figures 7-8)
+  - `selected_features.md` with F-scores
+  - `figures/`: baseline-removal plot (record 101), example beats with
+    detected fiducial points for each class
+- `README.md`: install/run instructions (`requirements.txt`: numpy, scipy,
+  wfdb, scikit-learn, pandas, matplotlib, pyyaml), the full assumptions list,
+  the metric-definition finding, which split protocol reproduces the paper,
+  and an honest "Differences from the original" section.
+- `tests/`: label mapping, beat-window extraction, RR features on a synthetic
+  RR sequence, the micro-averaging formula (feed a known confusion matrix and
+  check 1-2e/K and 1-e/(K-1)), and an assertion that no test record appears in
+  training under protocol A.
+
+## Working rules
+
+- Fix all seeds; the full run must be reproducible from one command.
+- Never fit scalers, feature selection or models on the test set (except in the
+  explicitly labelled "paper-faithful" ablations).
+- Do not report a number you did not compute. If results differ from the paper
+  by more than 1 percentage point, say so and list likely causes.
+- Build incrementally: first get features for one record (e.g. 119) and plot
+  fiducial points to sanity-check them, then all 44 records, then the models.
+
+Divide into threads if possible. make use of GPU if possible. "cuda" and "gpu"
+for reference, make the development simialr to lightGBM implementation, implemented in the
+previous directory cd.. (if possible).

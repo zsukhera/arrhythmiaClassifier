@@ -1,0 +1,11 @@
+numpy
+scipy
+wfdb
+scikit-learn
+pandas
+matplotlib
+pyyaml
+threadpoolctl
+pytest
+# GPU (optional): install the CuPy wheel matching your CUDA version, e.g.
+#   pip install cupy-cuda12x

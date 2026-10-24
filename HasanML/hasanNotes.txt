@@ -1,0 +1,53 @@
+
+23-10-2026
+Linear Regression:
+
+plain linear regression is almost never used as the classifier for MIT-BIH arrhythmia 
+classification. Most papers that say “regression” actually use logistic regression, 
+which is a classification model despite its name. I found no 5-class paper using 
+ordinary linear regression that meets your criteria.
+
+Papers found:
+[1] Binary (linear/ridge regression):
+X. He, T. Liu, F. Hadaeghi, and H. Jaeger, “Reservoir transfer on analog neuromorphic hardware,” 
+in Proc. 9th Int. IEEE/EMBS Conf. Neural Engineering (NER), San Francisco, CA, USA, 2019, pp. 1234–1238, 
+doi: 10.1109/NER.2019.8716891.
+
+[2] 5-class (logistic regression):
+Ö. Yakut and E. Doğru Bolat, “An efficient arrhythmic heartbeat classification method using ECG morphology based features,” 
+Euroasia J. Math., Eng., Nat. Med. Sci., vol. 7, no. 13, pp. 200–212, 2020, doi: 10.38065/euroasiaorg.403.
+
+Results for [1]:
+Setup. This replicates the software "Standard ESN" baseline of He et al. (NER 2019) and Liu (MSc thesis 2019, Table 4.1). The task is detecting PVC heartbeats, one model per patient, on 7 MIT-BIH records. The model is a 768-unit leaky ESN (leak 0.99, spectral radius 0.9) with a ridge-regression readout. Each patient's model trains on 10 minutes of ECG and is tested on the next 5 minutes. Results are the mean ± std over 5 random reservoirs. All hyperparameters were chosen by 5-fold cross-validation on the training window only; nothing was tuned on test data.
+
+Main result (spike input, test window 10:00–15:00). Mean accuracy is 95.99% and mean F1 is 91.33%, against the paper's 99.11% and 98.18%.
+- Matching within 1.5 pp: 119 (F1 99.6), 201 (100.0), 233 (99.6).
+- Lower than the paper: 106 (−5.0 pp), 200 (−5.1), 223 (−12.0: misses about 22% of PVCs), 203 (−27.3: precision 52%, as noisy normal beats get flagged as PVCs).
+- Every record beats always predicting "normal" by a wide margin.
+- The weak records also score low in cross-validation on the training window. So the gaps are not overfitting.
+
+Ambiguous settings, resolved by experiment:
+- Leak 0.99 clearly beats 0.01 (F1 91.3 vs 75.2), which agrees with the thesis's equation.
+- Spike and raw ECG input are tied on average (91.3 vs 91.4).
+- The thesis's λ = 1e-6 does much worse than λ chosen by CV (F1 72.0 vs 91.3).
+- Class-balanced ridge gives no gain.
+
+Checks against the paper:
+- Table 4.1 and the stated settings were checked against the thesis text.
+- All metrics were recomputed from the per-seed confusion counts and match.
+- Working back from Table 4.1's percentages gives the paper's test-set sizes. These show the paper did not test records 119 and 200 on 10:00–15:00: about 110 vs our 57 PVCs, and 170 vs our 101. For 106, 203, 223 and 233, no 5-minute window fits the paper's counts at all. The thesis only says "an interval of 10 minutes … and the next 5 minutes".
+
+Rerun on the windows the counts point to:
+
+┌────────┬─────────────┬──────────────────┬──────────┐
+│ Record │ Test window │ F1 (spike input) │ Paper F1 │
+├────────┼─────────────┼──────────────────┼──────────┤
+│ 119    │ 20:00–25:00 │ 100.00 ± 0.00    │ 99.55    │
+├────────┼─────────────┼──────────────────┼──────────┤
+│ 200    │ 15:00–20:00 │ 94.42 ± 0.81     │ 98.82    │
+└────────┴─────────────┴──────────────────┴──────────┘
+
+On 119 it now matches on the paper's exact test beats. On 200 the gap stays at −4.4 pp, mostly from lower sensitivity (89.8% vs 98.2%), so there it is a real model or preprocessing difference.
+
+Conclusion. The pipeline reproduces the paper on 3 of 7 records with the original split, and on 119 with the paper's own test window. The remaining gaps come from two things the paper doesn't specify: which window was tested, and preprocessing details (filter, beat window, smoothing). The size of the 203 and 223 gaps can't be settled without knowing the authors' exact test segments.
+

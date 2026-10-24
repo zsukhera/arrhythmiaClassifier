@@ -1,0 +1,172 @@
+================================================================================
+CLAUDE CODE PROMPT: Replicate He et al. (2019) binary PVC detection on MIT-BIH
+using an Echo State Network (ESN) with a linear (ridge) regression readout
+================================================================================
+
+Paste everything below this line into Claude Code.
+--------------------------------------------------------------------------------
+
+## Goal
+
+Replicate the software baseline ("Standard ESN") from:
+
+  X. He, T. Liu, F. Hadaeghi, and H. Jaeger, "Reservoir transfer on analog
+  neuromorphic hardware," Proc. 9th Int. IEEE/EMBS Conf. Neural Engineering
+  (NER), 2019, pp. 1234-1238, doi: 10.1109/NER.2019.8716891.
+
+The full experimental details are in T. Liu, "Harnessing Slow Dynamics in
+Neuromorphic Computation," MSc thesis, Jacobs University Bremen, 2019,
+arXiv:1905.12116 (Chapter 4.3, Table 4.1). Where the two disagree, follow the
+thesis.
+
+The task is a per-subject (patient-specific) BINARY heartbeat classifier:
+PVC (label 1) vs. every other beat (label 0). The classifier is a linear
+regression (ridge) readout trained on reservoir states. No handcrafted features.
+
+We do NOT have the Dynap-se neuromorphic hardware, so replicate only the
+"Standard ESN" rows of Table 4.1. A simulated spiking version is an optional
+stretch goal at the end.
+
+## Target results to compare against (Standard ESN, test set, Table 4.1)
+
+| Record | Accuracy | Sensitivity | Precision | F1      |
+|--------|----------|-------------|-----------|---------|
+| 106    | 98.75 %  | 97.22 %     | 97.22 %   | 97.22 % |
+| 119    | 99.70 %  | 100 %       | 99.10 %   | 99.55 % |
+| 200    | 99.07 %  | 98.24 %     | 99.40 %   | 98.82 % |
+| 201    | 99.24 %  | 100 %       | 97.18 %   | 98.57 % |
+| 203    | 98.14 %  | 100 %       | 90.32 %   | 94.92 % |
+| 223    | 99.07 %  | 99.05 %     | 98.11 %   | 98.58 % |
+| 233    | 99.78 %  | 100 %       | 99.21 %   | 99.60 % |
+
+Do not tune toward these numbers on the test set. They are for comparison only.
+
+## Data
+
+- Dataset: MIT-BIH Arrhythmia Database (PhysioNet, `mitdb`), 360 Hz, 11-bit.
+- Records: 106, 119, 200, 201, 203, 223, 233 (one independent model per record).
+- Download with the `wfdb` Python package (`wfdb.dl_database('mitdb', ...)` or
+  `wfdb.rdrecord(..., pn_dir='mitdb')`). Cache locally in `data/mitdb/`.
+- Use the MLII lead (channel 0 for these records; verify via `sig_name` and
+  log which channel was used).
+- Labels: from the `atr` annotations. PVC = symbol 'V' -> 1. All other beat
+  symbols -> 0. Ignore non-beat annotations (rhythm changes '+', noise '~',
+  '|', '"', etc.). Log the beat count per class per record.
+
+## Split (per record)
+
+- Training: the first 10 minutes of the recording (samples 0 to 10*60*360).
+- Test: the next 5 minutes (10:00 to 15:00).
+- Only beats whose R-peak annotation falls inside a window belong to it.
+- Within the training window, use 5-fold cross-validation over 5 contiguous
+  segments (2 minutes each, NOT shuffled) for hyperparameter selection.
+- The test window must never be used for any fitting or selection.
+
+## Pipeline (follow in this order)
+
+1. Preprocessing
+   - High-pass Butterworth filter to remove baseline drift. The thesis does not
+     give the order or cutoff: default to 4th order, 0.5 Hz, zero-phase
+     (`scipy.signal.sosfiltfilt`). Make both configurable.
+   - Min-max normalize to [0, 1]. Compute min/max on the TRAINING window only,
+     then apply to the test window (clip to [0,1]) to avoid leakage. Note in the
+     README that the thesis may have normalized the whole signal.
+
+2. Signal-to-spike encoding (delta modulation, thesis Sec. 2.2.2 / 4.3)
+   - Emit a spike at time t when |x(t) - x(t_last_spike)| > 0.1, where
+     t_last_spike is the time of the previous spike. Produce two input
+     channels: UP spikes (increase) and DOWN spikes (decrease).
+   - Implement a flag `--input {spikes,raw}`. Default `spikes`. With `raw`,
+     feed the normalized ECG directly to the ESN. The thesis is not explicit
+     about which input the Standard ESN baseline received, so run BOTH and
+     report both.
+
+3. Echo State Network (leaky-integrator ESN, Jaeger et al. 2007)
+   - Update: x(n+1) = (1 - a) * x(n) + a * tanh(W_in u(n+1) + W x(n) + b)
+   - Leaking rate a = 0.99 (thesis value "leakage rate = 0.99"; note that the
+     convention is ambiguous; also try a = 0.01 interpretation as an ablation
+     and report which matches the paper better).
+   - Spectral radius of W = 0.9.
+   - Reservoir size N = 768 (matches the 768-neuron hardware reservoir the
+     ESN was mirrored to). Make configurable.
+   - W: sparse random (e.g. 10% connectivity), normal entries, rescaled to the
+     target spectral radius. W_in: uniform in [-s, s], input scaling s is a
+     CV hyperparameter (grid: 0.1, 0.5, 1.0). Fixed random seed; repeat over
+     5 seeds and report mean +/- std.
+   - Discard an initial washout (e.g. first 2 s) from training.
+   - Run the reservoir continuously through train then test (the test window
+     follows the train window in time), but only fit on training states.
+
+4. State smoothing
+   - Smooth reservoir states with an exponential decay kernel (time constant
+     tau). The thesis says tau is a per-subject hyperparameter: select it by CV
+     from a grid such as {10, 25, 50, 100, 200} ms.
+
+5. Readout: ridge (linear) regression
+   - Target y(t): a {0,1} time series that is 1 inside each PVC beat and 0
+     elsewhere. The thesis does not define the beat window: default to
+     [R - 100 ms, R + 150 ms] around each annotated R peak, configurable.
+   - W_out = Y X^T (X X^T + lambda I)^-1, with a bias column.
+   - lambda: CV-selected from {1e-8, 1e-6, 1e-4, 1e-2, 1}. Report results
+     with lambda fixed at 1e-6 too, since that is the value the thesis states.
+   - Optionally add class weighting (weighted ridge) as an ablation, since PVCs
+     are a minority in some records.
+
+6. Converting the output to per-beat labels
+   - For each annotated beat, take the readout output in the beat window
+     (mean or max: make configurable, default mean) and binarize with
+     threshold theta. Select theta by CV (grid 0.1 to 0.9, step 0.05).
+
+7. Evaluation (per beat, on the test window only)
+   - Accuracy = (TP+TN)/(TP+TN+FP+FN), Sensitivity = TP/(TP+FN),
+     Precision = TP/(TP+FP), F1 = 2TP/(2TP+FP+FN), PVC = positive class.
+   - Also report specificity, the confusion matrix, test beat counts, and the
+     "all-normal" baseline accuracy (accuracy if every beat is predicted 0),
+     so it is clear how much the model adds over the class prior.
+
+## Deliverables
+
+- `src/` with modules: `data.py`, `preprocess.py`, `encode.py`, `esn.py`,
+  `readout.py`, `evaluate.py`, and `run_experiment.py` (CLI with argparse).
+- `configs/default.yaml` with every hyperparameter and assumption above.
+- `results/results_table.csv` and `results/results_table.md`: per record,
+  our metrics next to the paper's Table 4.1 numbers, plus the difference.
+- `results/figures/`: for each record, a plot of a test segment showing ECG,
+  readout output, threshold, and true/predicted PVC markers.
+- `README.md` containing:
+  - how to install (`requirements.txt`: numpy, scipy, wfdb, scikit-learn,
+    pandas, matplotlib, pyyaml) and run (`python -m src.run_experiment
+    --config configs/default.yaml`).
+  - a section "Assumptions where the paper/thesis is unspecified", listing
+    every default chosen above: filter order/cutoff, normalization scope,
+    ESN input (spikes vs raw), leak-rate convention, W_in scaling, sparsity,
+    washout, beat window, per-beat aggregation, CV grids.
+  - a section "Differences from the original", stating that this is the
+    software ESN only, not Dynap-se hardware.
+- Unit tests (`tests/`) for: delta-modulation spike encoder, spectral radius
+  scaling, ridge solution vs `sklearn.linear_model.Ridge`, label extraction
+  ('V' -> 1), and that no test-window sample is used in fitting.
+
+## Working rules
+
+- Fix all random seeds; the full run must be reproducible.
+- Never fit, normalize, or select hyperparameters on the test window.
+- Do not report a number you did not compute. If a result differs from the
+  paper by more than 2 percentage points, say so in the README and list the
+  most likely causes rather than tuning on the test set.
+- Start by downloading one record (119), get the full pipeline working end to
+  end on it, then run all seven records.
+
+## Optional stretch goal: spiking reservoir
+
+If time allows, add `--reservoir lif` using Brian2 to simulate a 768-neuron
+leaky integrate-and-fire reservoir driven by the UP/DOWN spike trains, with
+recurrent weights obtained by "reservoir transfer": drive the ESN (teacher)
+and the LIF network (student) with white noise, then solve a ternary
+({-1,0,1}) linear regression so that W_student r(t) approximates the teacher
+states x(t) (thesis Sec. 4.1-4.2). Compare against the Dynap-se rows of
+Table 4.1, but note that a simulation will not reproduce hardware mismatch.
+
+Divide into threads if possible. make use of GPU if possible. "cuda" and "gpu"
+for reference, make the development simialr to lightGBM implementation, implemented in the
+previous directory cd.. (if possible).

@@ -1,0 +1,67 @@
+# Replication of the "Standard ESN" baseline of He et al. (NER 2019) /
+# Liu (MSc thesis 2019, arXiv:1905.12116, Ch. 4.3, Table 4.1).
+# Every value marked [assumption] is not specified by the paper or thesis;
+# see README.md, "Assumptions where the paper/thesis is unspecified".
+
+seeds: [0, 1, 2, 3, 4]              # reservoir seeds; results reported as mean +/- std
+
+data:
+  data_dir: data/mitdb              # relative to the project root (HasanML/paper1)
+  local_mirrors:                    # copied from here before trying a PhysioNet download
+    - ../../datasets/mitbih/mitdb
+  records: ["106", "119", "200", "201", "203", "223", "233"]
+  lead: MLII
+  fs: 360
+
+split:
+  start_minutes: 0                  # train window starts here [assumption: thesis says "an interval of 10 minutes"]
+  start_minutes_per_record: {}      # e.g. {"200": 5} -> train 5-15 min, test 15-20 min
+  train_minutes: 10                 # samples [start, start + 10 min) -> training
+  test_minutes: 5                   # the next 5 minutes -> test
+  n_cv_folds: 5                     # contiguous 2-minute folds, not shuffled
+
+preprocess:
+  highpass_order: 4                 # [assumption]
+  highpass_cutoff_hz: 0.5           # [assumption]
+  zero_phase: true                  # sosfiltfilt; train window filtered on its own (no test leakage)
+  normalization_scope: train        # train | full ("full" mimics a whole-signal normalisation; leaks)
+
+encoding:
+  inputs: [spikes, raw]             # thesis is ambiguous about the Standard ESN input -> run both
+  delta_threshold: 0.1              # delta-modulation threshold on the [0,1]-normalised ECG
+
+esn:
+  n_reservoir: 768
+  spectral_radius: 0.9
+  connectivity: 0.1                 # [assumption] fraction of non-zero recurrent weights
+  leak_rates: [0.99, 0.01]          # 0.99 = thesis value; 0.01 = the other reading of "leakage rate"
+  input_scalings: [0.1, 0.5, 1.0]   # W_in ~ U[-s, s]; s selected by CV
+  bias_scaling: 0.2                 # [assumption] b ~ U[-0.2, 0.2]
+  washout_seconds: 2.0              # [assumption]
+
+smoothing:
+  tau_ms: [10, 25, 50, 100, 200]    # exponential state smoothing, selected by CV
+
+readout:
+  beat_window_ms: [-100, 150]       # [assumption] target = 1 in [R-100ms, R+150ms) of each PVC
+  lambdas: [1.0e-8, 1.0e-6, 1.0e-4, 1.0e-2, 1.0]
+  fixed_lambda: 1.0e-6              # thesis value; reported as a separate variant
+  class_weightings: [none, balanced]  # "balanced" = weighted-ridge ablation
+  aggregation: mean                 # mean | max of the readout over each beat window
+  thresholds: {start: 0.1, stop: 0.9, step: 0.05}
+
+compute:
+  device: auto                      # auto | cpu | cuda | gpu  (cuda == gpu; needs CuPy)
+  cpu_workers: 6                    # processes (auto = limited by cores and free RAM). On the
+                                    # 22-thread Core Ultra 7 155H under WSL, 6 beat 12 (aggregate
+                                    # throughput saturates at ~2.8x one core; more just contends)
+  cpu_batch_size: 1                 # reservoirs per CPU process job
+  gpu_batch_size: 15                # reservoirs simulated together per GPU job
+  gpu_workers: 2                    # host threads feeding the GPU
+  chunk_size: 720                   # time steps per chunk (2 s)
+  cache: true                       # save each reservoir run to results/cache; reruns resume
+
+output:
+  results_dir: results
+  plot_seconds: 10
+  plot_seed: 0

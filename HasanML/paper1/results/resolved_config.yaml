@@ -1,0 +1,86 @@
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+data:
+  data_dir: data/mitdb
+  local_mirrors:
+  - ../../datasets/mitbih/mitdb
+  records:
+  - '106'
+  - '119'
+  - '200'
+  - '201'
+  - '203'
+  - '223'
+  - '233'
+  lead: MLII
+  fs: 360
+split:
+  train_minutes: 10
+  test_minutes: 5
+  n_cv_folds: 5
+preprocess:
+  highpass_order: 4
+  highpass_cutoff_hz: 0.5
+  zero_phase: true
+  normalization_scope: train
+encoding:
+  inputs:
+  - spikes
+  - raw
+  delta_threshold: 0.1
+esn:
+  n_reservoir: 768
+  spectral_radius: 0.9
+  connectivity: 0.1
+  leak_rates:
+  - 0.99
+  - 0.01
+  input_scalings:
+  - 0.1
+  - 0.5
+  - 1.0
+  bias_scaling: 0.2
+  washout_seconds: 2.0
+smoothing:
+  tau_ms:
+  - 10
+  - 25
+  - 50
+  - 100
+  - 200
+readout:
+  beat_window_ms:
+  - -100
+  - 150
+  lambdas:
+  - 1.0e-08
+  - 1.0e-06
+  - 0.0001
+  - 0.01
+  - 1.0
+  fixed_lambda: 1.0e-06
+  class_weightings:
+  - none
+  - balanced
+  aggregation: mean
+  thresholds:
+    start: 0.1
+    stop: 0.9
+    step: 0.05
+compute:
+  device: auto
+  cpu_workers: 6
+  cpu_batch_size: 1
+  gpu_batch_size: 15
+  gpu_workers: 2
+  chunk_size: 720
+  cache: true
+output:
+  results_dir: results
+  plot_seconds: 10
+  plot_seed: 0
+resolved_device: cpu

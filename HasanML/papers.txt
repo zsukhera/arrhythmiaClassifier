@@ -1,0 +1,17 @@
+
+Paper index has to be maintained because further directories refer to this index
+Linear Regression:
+
+Papers found:
+Index:1 
+directory name: paper1
+[1] Binary (linear/ridge regression):
+X. He, T. Liu, F. Hadaeghi, and H. Jaeger, “Reservoir transfer on analog neuromorphic hardware,” 
+in Proc. 9th Int. IEEE/EMBS Conf. Neural Engineering (NER), San Francisco, CA, USA, 2019, pp. 1234–1238, 
+doi: 10.1109/NER.2019.8716891.
+
+Index:2 
+dire name: paper2
+[2] 5-class (logistic regression):
+Ö. Yakut and E. Doğru Bolat, “An efficient arrhythmic heartbeat classification method using ECG morphology based features,” 
+Euroasia J. Math., Eng., Nat. Med. Sci., vol. 7, no. 13, pp. 200–212, 2020, doi: 10.38065/euroasiaorg.403.
