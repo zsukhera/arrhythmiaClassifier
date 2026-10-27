@@ -17,6 +17,8 @@ doi: 10.1109/NER.2019.8716891.
 Ö. Yakut and E. Doğru Bolat, “An efficient arrhythmic heartbeat classification method using ECG morphology based features,” 
 Euroasia J. Math., Eng., Nat. Med. Sci., vol. 7, no. 13, pp. 200–212, 2020, doi: 10.38065/euroasiaorg.403.
 
+------------------------------------------------------------------------------------------------------------------------------------------
+
 Results for [1]:
 Setup. This replicates the software "Standard ESN" baseline of He et al. (NER 2019) and Liu (MSc thesis 2019, Table 4.1). The task is detecting PVC heartbeats, one model per patient, on 7 MIT-BIH records. The model is a 768-unit leaky ESN (leak 0.99, spectral radius 0.9) with a ridge-regression readout. Each patient's model trains on 10 minutes of ECG and is tested on the next 5 minutes. Results are the mean ± std over 5 random reservoirs. All hyperparameters were chosen by 5-fold cross-validation on the training window only; nothing was tuned on test data.
 
@@ -50,4 +52,20 @@ Rerun on the windows the counts point to:
 On 119 it now matches on the paper's exact test beats. On 200 the gap stays at −4.4 pp, mostly from lower sensitivity (89.8% vs 98.2%), so there it is a real model or preprocessing difference.
 
 Conclusion. The pipeline reproduces the paper on 3 of 7 records with the original split, and on 119 with the paper's own test window. The remaining gaps come from two things the paper doesn't specify: which window was tested, and preprocessing details (filter, beat window, smoothing). The size of the 203 and 223 gaps can't be settled without knowing the authors' exact test segments.
+
+------------------------------------------------------------------------------------------------------------------------------------------
+
+ Results for [2] (Yakut & Doğru Bolat, 2020; 5-class AAMI, morphology features + Logistic Regression)
+▎
+▎ Setup. We extracted 57 morphology and RR features from MIT-BIH beats (MLII lead; 44 records, paced records excluded; 256-sample windows; 1 Hz elliptic baseline removal). Beats were classified as N/S/V/F/Q with scikit-learn defaults: LR, LDA, SVM and MLP, using all 57 features or the top 20 chosen by SelectKBest. Splits: (A) inter-patient (de Chazal DS1/DS2), (B) a random beat-level split with the paper's class proportions, (C) 5-fold cross-validation. Scaling and feature selection were fit on training data only.
+▎
+▎ Data. The beat counts match the paper's Table 1 exactly for S, V, F and Q (N: +4). The DS1/DS2 inter-patient split reproduces the paper's train/test counts per class, so the paper most likely used it.
+▎
+▎ Metric definitions. On the test rows, the paper's "Accuracy" and "Specificity" are one-vs-rest averages. They follow exactly from its "Sensitivity", which is plain 5-class accuracy. The proposed LR therefore reaches 99.50% (57 features) / 99.42% (20 features) multiclass accuracy, not the 99.80% / 99.77% headline. The paper's "F1" is mostly the harmonic mean of sensitivity and specificity rather than an F1 score, and its training rows use a different, undefined metric.
+▎
+▎ Main result (plain 5-class accuracy, LR). Inter-patient: 94.4% (57 features) / 93.5% (20 features), against the paper's 99.50% / 99.42% and an 88.8% "always N" baseline. S-beat sensitivity is only 6.5%. Random beat-level split: 95.4%; 5-fold CV: 96.2%. LR stays 3.3–5.9 points below the paper under every split.
+▎
+▎ Other classifiers. SVM and MLP match or exceed the paper's numbers only when the same patient's beats appear in both training and test (5-fold CV, 57 features: MLP 98.8%, SVM 98.1%, against the paper's 96.6% / 97.0%). Under the inter-patient split, all models fall 2–10 points short. Our ranking (MLP > SVM > LR ≈ LDA) is the reverse of the paper's (LR > LDA > SVM > MLP).
+▎
+▎ Conclusion. The data and split are reproduced, but the paper's LR accuracy is not. The likely causes are: (1) fiducial-point and feature definitions only described in the author's thesis (our features separate the classes less well: 4–14 pass the paper's F > 1000 cut, against 20); (2) an unconfirmed split (Fig. 1 is not readable); (3) the paper's non-standard metrics. Fitting the scaler and feature selection on all data, as the paper does, or dropping the R-time feature changes results by at most ~1.4 points (one exception: MLP inter-patient, −3.3).
 

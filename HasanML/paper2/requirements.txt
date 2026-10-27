@@ -1,0 +1,11 @@
+numpy
+scipy
+wfdb
+scikit-learn
+pandas
+matplotlib
+pyyaml
+threadpoolctl
+pytest
+# GPU (optional, NVIDIA + CUDA only): RAPIDS cuML for LR/SVM, e.g.
+#   pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12

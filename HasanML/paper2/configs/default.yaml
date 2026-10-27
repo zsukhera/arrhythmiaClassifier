@@ -1,0 +1,79 @@
+# Replication of Yakut & Dogru Bolat (2020), "An efficient arrhythmic heartbeat
+# classification method using ECG morphology based features", Euroasia J. Math.,
+# Eng., Nat. Med. Sci. 7(13):200-212, doi:10.38065/euroasiaorg.403.
+# Every value marked [assumption] is not specified by the paper; see README.md,
+# "Assumptions".
+
+seed: 0                               # random_state for every split / model that takes one
+
+data:
+  data_dir: data/mitdb                # relative to the project root (HasanML/paper2)
+  local_mirrors:                      # copied from here before trying a PhysioNet download
+    - ../../datasets/mitbih/mitdb
+  lead: MLII                          # selected by sig_name (114 has its leads swapped)
+  fs: 360
+  exclude_records: ["102", "104", "107", "217"]   # paced [assumption: the paper's Q has only 15 beats]
+  label_map: paper                    # paper (Table 1) | aami (ANSI/AAMI EC57)
+
+preprocess:
+  baseline:                           # baseline = elliptic low-pass(raw); signal = raw - baseline
+    order: 4                          # [assumption]
+    cutoff_hz: 1.0                    # paper: "does not pass noise below 1 Hz"
+    rp_db: 0.1                        # [assumption] passband ripple
+    rs_db: 40.0                       # [assumption] stopband attenuation
+    zero_phase: true                  # [assumption] sosfiltfilt
+  window_before: 127                  # samples before R (R sits at index 127)
+  window_after: 128                   # samples after R  -> 256-sample beat window
+
+fiducials:                            # search windows relative to the refined R peak, ms [assumption]
+  r_refine_samples: 10                # R = local max within +/-10 samples of the annotation
+  p_window_ms: [-250, -80]
+  q_window_ms: [-80, 0]
+  s_window_ms: [0, 80]
+  t_window_ms: [100, 350]             # clipped to the end of the 256-sample window (~R+353 ms is
+                                      # the window end, so the clip only bites when R is refined right)
+  wave_amplitude_frac: 0.2            # P/T on-/offset: first point (walking out from the peak) whose
+                                      # |x - iso| drops below this fraction of |peak - iso|
+  qrs_slope_frac: 0.1                 # Q onset / S offset: first point (walking out) whose |dx/dt|
+                                      # drops below this fraction of the max |dx/dt| in the QRS
+  qrs_edge_ms: 40                     # Q1/S2 walks start at the steepest point within 40 ms of Q/S
+  iso_level: median                   # isoelectric reference per beat = median of the beat window
+
+features:
+  rr_local_n: 5                       # RR local average = mean of 5 RR before + 5 after the beat
+  feature35: r_time_s                 # "IR time information" [assumption]: R-peak time in the record (s)
+
+normalization:
+  scope: train                        # train (default) | all ("paper-faithful": fit on all data first)
+
+selection:
+  k: 20
+  scope: train                        # train (default) | all (ablation)
+
+models:                               # scikit-learn defaults; seeds only where the model takes one
+  names: [LR, LDA, SVM, MLP]
+  lr_max_iter_alt: 5000               # extra LR run if the default max_iter=100 does not converge
+  mlp_seeds: [0, 1, 2, 3, 4]
+
+protocols: [A, B, C]                  # A = inter-patient DS1/DS2, B = intra-patient stratified
+                                      # split matching Table 1, C = 5-fold stratified CV
+cv_folds: 5
+
+ablations:                            # each runs on top of the default pipeline, every protocol
+  scaler_all: true                    # paper-faithful min-max fit on all beats
+  select_all: true                    # SelectKBest fit on all beats (20-feature runs only)
+  no_feature35: true                  # drop the R-time feature (record-identity leak)
+  models: [LR, LDA, SVM, MLP]         # MLP ablations use the first MLP seed only
+
+compute:
+  device: auto                        # auto | cpu | cuda | gpu  (cuda == gpu; needs cuML + CUDA)
+  feature_workers: 8                  # processes for per-record feature extraction
+  cpu_workers: 8                      # processes for model fits (auto = cores and free RAM)
+  blas_threads: 2                     # BLAS/OpenMP threads per fit process
+  gpu_workers: 2                      # host threads feeding the GPU (cuML LR/SVM jobs)
+
+output:
+  results_dir: results
+  cache_dir: results/cache
+  example_record: "119"               # fiducial sanity-check figure
+  baseline_record: "101"              # paper Figure 2

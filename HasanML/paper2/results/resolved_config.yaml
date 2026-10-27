@@ -1,0 +1,90 @@
+seed: 0
+data:
+  data_dir: data/mitdb
+  local_mirrors:
+  - ../../datasets/mitbih/mitdb
+  lead: MLII
+  fs: 360
+  exclude_records:
+  - '102'
+  - '104'
+  - '107'
+  - '217'
+  label_map: paper
+preprocess:
+  baseline:
+    order: 4
+    cutoff_hz: 1.0
+    rp_db: 0.1
+    rs_db: 40.0
+    zero_phase: true
+  window_before: 127
+  window_after: 128
+fiducials:
+  r_refine_samples: 10
+  p_window_ms:
+  - -250
+  - -80
+  q_window_ms:
+  - -80
+  - 0
+  s_window_ms:
+  - 0
+  - 80
+  t_window_ms:
+  - 100
+  - 350
+  wave_amplitude_frac: 0.2
+  qrs_slope_frac: 0.1
+  qrs_edge_ms: 40
+  iso_level: median
+features:
+  rr_local_n: 5
+  feature35: r_time_s
+normalization:
+  scope: train
+selection:
+  k: 20
+  scope: train
+models:
+  names:
+  - LR
+  - LDA
+  - SVM
+  - MLP
+  lr_max_iter_alt: 5000
+  mlp_seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+protocols:
+- A
+- B
+- C
+cv_folds: 5
+ablations:
+  scaler_all: true
+  select_all: true
+  no_feature35: true
+  models:
+  - LR
+  - LDA
+  - SVM
+  - MLP
+compute:
+  device: auto
+  feature_workers: 8
+  cpu_workers: 8
+  blas_threads: 2
+  gpu_workers: 2
+output:
+  results_dir: results
+  cache_dir: results/cache
+  example_record: '119'
+  baseline_record: '101'
+nfeat:
+- 57
+- 20
+run_ablations: true
