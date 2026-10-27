@@ -107,7 +107,7 @@ Every item is a key in `configs/default.yaml`.
 
 | # | Item | Paper says | Our choice |
 |---|---|---|---|
-| 1 | Paced records | unspecified | excluded (Q has only 15 beats; our counts then match Table 1, see below) |
+| 1 | Paced records | Fig. 1: 102, 104, 107, 217 excluded | excluded (confirmed by Fig. 1; our counts then match Table 1) |
 | 2 | Baseline filter | "lowpass elliptic IIR … does not pass noise below 1 Hz" | baseline = ellip(order 4, 0.1 dB, 40 dB, 1 Hz) low-pass, zero-phase; signal − baseline |
 | 3 | Fiducial search windows | Fig. 3, not legible | relative to R: P [−250, −80] ms, Q [−80, 0), S (0, 80], T [100, 350] ms, clipped to the window end (R + 353 ms); clipping happens for the ~2 % of beats whose refined R lies right of the annotation |
 | 4 | R | annotation | local max within ±10 samples of the annotation |
@@ -122,7 +122,7 @@ Every item is a key in `configs/default.yaml`.
 | 13 | Features 48–57 | "intervals" | durations between consecutive points P1→P→P2→Q1→Q→R→S→S2→T1→T→T2 (ms) |
 | 14 | Normalisation fit | implied: all data before the split | training set (default); `scaler_all` ablation = paper-faithful |
 | 15 | Feature selection fit | unspecified | training set (default); `select_all` ablation = all beats |
-| 16 | Split | not named (Fig. 1 illegible) | three protocols (A default) |
+| 16 | Split | Fig. 1: the 44 records are divided equally into training and test sets (record level) | protocol A (DS1/DS2) is the faithful one; B and C are run for comparison |
 | 17 | Class order for metrics | – | N, S, V, F, Q; K = 5 in every averaged metric |
 
 Some of the 57 features duplicate others exactly (for example QR = int Q→R and
@@ -198,7 +198,14 @@ separated.
 
 ### Which protocol reproduces the paper?
 
-- **Counts point to A** (inter-patient DS1/DS2): the match is exact per class.
+- **The paper used a record-level (inter-patient) split.** Its Figure 1 (an image in
+  the PDF, extracted and read directly) shows: 48 records → the 4 paced records
+  excluded → "the remaining 44 records … equally into the data sets" → training
+  51 527 / testing 49 825 beats. That is 22 / 22 records, and DS1/DS2 reproduces the
+  per-class counts exactly, so **protocol A is the faithful replication**. (DS1/DS2 is
+  not strictly patient-disjoint: records 201 and 202 come from the same patient and sit
+  on opposite sides.)
+- **Counts confirm A**: the match is exact per class.
 - **Results point to B/C** (intra-patient). Under A every model is 2.3–10.5 pp below the
   paper in plain accuracy, and S sensitivity is < 15 %. That is the typical
   inter-patient failure on S beats and in line with published inter-patient results.
@@ -212,9 +219,10 @@ separated.
   (MLP > SVM > LR ≈ LDA), which is the usual ranking for min-max-scaled handcrafted
   features with default hyperparameters.
 
-So no single protocol reproduces both the paper's counts and its results. A linear
-model at 99.4–99.5 % 5-class accuracy on an inter-patient split would far exceed
-published inter-patient results. We cannot explain the paper's LR numbers with the
+So the paper's results are only approached under beat-level splits, which the paper
+did not use. Under its own record-level split our LR reaches 94.4 % (57 F) / 93.5 %
+(20 F) against 99.50 % / 99.42 %. A linear model at 99.4–99.5 % 5-class accuracy on an
+inter-patient split would far exceed published inter-patient results. We cannot explain the paper's LR numbers with the
 information in the paper.
 
 ### Ablations (`results/results_summary.md`, last table)
@@ -246,8 +254,19 @@ and `results/fscores_*.png` (paper Fig. 5).
   feature 35 and features 36–57 are unavailable. Our features are clearly less
   discriminative (see Feature selection), which alone could explain a several-pp gap
   for the linear models, which cannot compensate for weak features the way SVM/MLP can.
-- **Split unknown.** Counts match DS1/DS2 exactly, but the results only come near the
-  paper intra-patient (B/C), and LR not even there.
+- **Split.** Fig. 1 shows a record-level 22/22 split, and DS1/DS2 matches its counts
+  exactly. Our assignment of records to the two sets is inferred from the counts; the
+  paper does not list them. Under it, every model falls 2.3–10.5 pp short of the paper.
+- **Figure 3 (fiducial schematic)** confirms the definitions of P width, PR interval
+  (P1→Q1), QRS (Q1→S2), QT (Q1→T2), T width, P1R/P2R/PR and RT1/RT/RT2. It labels
+  S2→T1 as the "ST segment", while our feature 17 ("ST interval") is S2→T2. The figure
+  gives nominal durations only, not the search-window boundaries.
+- **Figure 5 (selected features)** lists the paper's top 20 by number: 34, 50, 53, 12,
+  33, 13, 28, 27, 48, 29, 47, 56, 55, 54, 52, 49, 31, 9, 11, 32, with F ≈ 1000–2620.
+  Its top two are RR local average (≈ 2620) and an inter-fiducial interval. Its
+  RR average, a per-record constant, scores ≈ 1900. Our F-scores for the same features
+  are lower (e.g. RR local average 758, RR average 847 on all beats), and our ranking
+  differs (our top: Pre-RR, amp S2, angle R-S-S2).
 - **Toolchain.** The paper filtered the ECG and extracted features in MATLAB R2015b, and
   ran scikit-learn (version not given) on Google Colab in late 2020. Our filter and
   features are a Python re-implementation, and the LR default (`lbfgs`, `max_iter=100`)

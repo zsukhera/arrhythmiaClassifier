@@ -1,0 +1,194 @@
+MEMORY REQUIREMENTS ANALYSIS: paper-2 5-class Logistic Regression (Yakut & Dogru Bolat 2020)
+Generated 2026-10-27 10:51 by `python -m src.memory_analysis` (63 s before writing)
+Host: x86_64, Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43, Python 3.14.4, NumPy 2.5.3, scikit-learn 1.9.1
+Deployed model: min-max scaler + [SelectKBest k=20] + LogisticRegression(max_iter=5000), fit on DS1 (22 records, patient-level split); evaluated on DS2 (22 other records).
+Numbers marked (measured) come from this host; (analytic) are computed from the algorithm; device memory figures are nominal and should be confirmed for the exact board.
+
+====================================================================================================
+1. MODEL SIZE (measured)
+====================================================================================================
+Variant      LR params  Scaler params  float64  float32  int8 W + fp32 scaler  sklearn joblib  fp32 .npz  LR iters
+-----------  ---------  -------------  -------  -------  --------------------  --------------  ---------  --------
+57 features        290            114  3.16 KB  1.58 KB                 781 B         5.84 KB    2.85 KB       174
+20 features        105             40  1.13 KB    580 B                 300 B         5.52 KB    1.80 KB       147
+
+The trained classifier itself is tiny: 290 parameters (57 F) or 105 (20 F), i.e. 1.2 KB / 0.4 KB in
+float32. The sklearn pickle is larger only because of Python object overhead. Model storage is not a
+constraint on any target; the runtime around it (Python, feature extraction buffers) is.
+Selected 20 features (fit on DS1): QS, QRS interval, RS, ST interval, P amplitude, PR amplitude, T amplitude, QR area, RS area, angle Q1-Q-R, angle R-S-S2, Pre-RR, RR local average, amp P, amp S2, amp T1, amp T, amp T2, amp baseline, int R-S.
+
+====================================================================================================
+2. NUMERIC PRECISION AND QUANTISATION (measured on the DS2 test set)
+====================================================================================================
+
+57 features:
+Weights / arithmetic                        Weight bytes  Acc %  Macro F1 %  Se S %  Se V %  Agree w/ fp64 %
+------------------------------------------  ------------  -----  ----------  ------  ------  ---------------
+float64 (sklearn)                                2.27 KB  94.40       47.31     6.4    86.3          100.000
+float32                                          1.13 KB  94.40       47.31     6.4    86.3          100.000
+float16 weights, fp32 math                         580 B  94.40       47.31     6.4    86.3          100.000
+int8 weights (per-class scale), fp32 input         325 B  94.39       47.10     5.8    85.5           99.809
+int8 weights + uint8 inputs (integer MACs)         325 B  94.39       47.03     5.7    85.5           99.789
+
+20 features:
+Weights / arithmetic                        Weight bytes  Acc %  Macro F1 %  Se S %  Se V %  Agree w/ fp64 %
+------------------------------------------  ------------  -----  ----------  ------  ------  ---------------
+float64 (sklearn)                                  840 B  93.53       44.13     1.1    72.2          100.000
+float32                                            420 B  93.53       44.13     1.1    72.2          100.000
+float16 weights, fp32 math                         210 B  93.53       44.13     1.1    72.1           99.990
+int8 weights (per-class scale), fp32 input         140 B  93.61       45.07     1.1    74.5           99.591
+int8 weights + uint8 inputs (integer MACs)         140 B  93.61       45.05     1.2    74.6           99.585
+
+float32 is exact for practical purposes, so ESP32 (single-precision FPU only) loses nothing by avoiding
+double. int8 rows show what a fully integer-quantised LR would cost; use them to decide whether int8
+is worth it. Since the float32 model is only ~1 KB, quantisation is optional for memory and mainly
+useful for speed on MCUs without an FPU, or for the student in a distillation setup.
+
+====================================================================================================
+3. RUNTIME MEMORY OF EACH SOFTWARE STACK (measured, peak RSS, fresh process each, x86_64)
+====================================================================================================
+Stack / stage                                              Peak RSS  Above bare Python
+--------------------------------------------------------  ---------  -----------------
+Python interpreter only                                    10.91 MB                0 B
++ NumPy                                                    27.23 MB           16.31 MB
++ NumPy + scikit-learn (LR, MinMaxScaler imported)        155.12 MB          144.20 MB
+sklearn pipeline: load joblib (20 F) + predict 1 beat     157.83 MB          146.91 MB
+NumPy-only: load float32 npz (20 F) + predict 1 beat       37.11 MB           26.20 MB
+Batch cloud inference: 49,825 test beats, sklearn (57 F)  202.26 MB          191.34 MB
+
+Inference latency on this host (per beat, model only, features already computed):
+  57 F: NumPy float32 dot 3.2 us | sklearn predict() one beat 160.8 us | sklearn batch 1.37 us/beat
+  20 F: NumPy float32 dot 5.8 us | sklearn predict() one beat 142.7 us | sklearn batch 0.23 us/beat
+Offline feature extraction (whole record 208, 2,951 beats, vectorised NumPy): 0.059 ms/beat, peak RSS 203.97 MB (+44.89 MB above the imported stack).
+On a Raspberry Pi (ARM64) RSS figures are of the same order; latency is ~3-10x higher than on this
+x86 host, still far below the >= 300 ms between heartbeats.
+
+====================================================================================================
+4. TRAINING MEMORY (cloud; measured, 1 BLAS thread)
+====================================================================================================
+Training set                 Beats x features  X (float64)   Peak RSS  RSS added by fit  Fit time  Iterations
+---------------------------  ----------------  -----------  ---------  ----------------  --------  ----------
+DS1 train, 57 features            51,528 x 57     22.41 MB  185.68 MB           7.69 MB     3.1 s         166
+DS1 train, 20 features            51,528 x 20      7.86 MB  178.84 MB          15.34 MB     1.7 s         129
+all 44 records, 57 features      101,356 x 57     44.08 MB  214.25 MB          13.86 MB     5.9 s         152
+
+LR training needs roughly the design matrix plus a few copies of it. A full replication run
+(all models, 5-fold CV) needs more because SVM/MLP run in parallel processes, each holding its own
+copy of the data. Training belongs in the cloud or on a workstation; a Pi 4/5 could retrain LR
+(tens of MB), an ESP32 cannot (the training matrix alone is ~10-25 MB).
+
+====================================================================================================
+5. STREAMING ON-DEVICE INFERENCE BUDGET (analytic, C, float32, static buffers)
+====================================================================================================
+
+57-feature model:
+Buffer                                                                              Bytes  Note                                                          
+-------------------------------------------------------------------------------  --------  --------------------------------------------------------------
+ADC sample ring (int16, 2 x window: R-peak search + 128-sample look-ahead)        1,024 B  raw 11-bit samples                                            
+Baseline filter: 2nd-order sections, coefficients + state (float32)                  64 B  2 biquads; causal sosfilt                                     
+Baseline-corrected sample ring (float32, 2 x window)                              2,048 B                                                                
+R-peak detector state (Pan-Tompkins-style: band-pass, derivative, 150 ms MWI)       408 B  needed on device; the paper used annotations                  
+Beat window copy for fiducial detection (float32)                                 1,024 B                                                                
+Fiducial scratch: |x - iso|, |dx|, median sort buffer (float32)                   3,072 B                                                                
+Fiducial indices (11 x int16) + iso level                                            26 B                                                                
+Pending feature vectors: 6 beats x 57 float32 (wait for Post-RR + 5 future RRs)   1,368 B  morphology features computed once, RR features filled in later
+R-time ring for RR features (11 x uint32) + running record RR mean                   60 B  'RR average' becomes a running mean                           
+Scaler for the 57 model inputs: min + scale (float32)                               456 B                                                                
+Selected-feature index list (none)                                                    0 B                                                                
+LR weights 5 x 57 + 5 bias (float32)                                              1,160 B                                                                
+Scaled input vector + 5 logits (float32)                                            248 B                                                                
+TOTAL static RAM                                                                 10,958 B  10.70 KB                                                      
+
+20-feature model:
+Buffer                                                                             Bytes  Note                                                          
+-------------------------------------------------------------------------------  -------  --------------------------------------------------------------
+ADC sample ring (int16, 2 x window: R-peak search + 128-sample look-ahead)       1,024 B  raw 11-bit samples                                            
+Baseline filter: 2nd-order sections, coefficients + state (float32)                 64 B  2 biquads; causal sosfilt                                     
+Baseline-corrected sample ring (float32, 2 x window)                             2,048 B                                                                
+R-peak detector state (Pan-Tompkins-style: band-pass, derivative, 150 ms MWI)      408 B  needed on device; the paper used annotations                  
+Beat window copy for fiducial detection (float32)                                1,024 B                                                                
+Fiducial scratch: |x - iso|, |dx|, median sort buffer (float32)                  3,072 B                                                                
+Fiducial indices (11 x int16) + iso level                                           26 B                                                                
+Pending feature vectors: 6 beats x 57 float32 (wait for Post-RR + 5 future RRs)  1,368 B  morphology features computed once, RR features filled in later
+R-time ring for RR features (11 x uint32) + running record RR mean                  60 B  'RR average' becomes a running mean                           
+Scaler for the 20 model inputs: min + scale (float32)                              160 B                                                                
+Selected-feature index list (uint8)                                                 20 B                                                                
+LR weights 5 x 20 + 5 bias (float32)                                               420 B                                                                
+Scaled input vector + 5 logits (float32)                                           100 B                                                                
+TOTAL static RAM                                                                 9,794 B  9.56 KB                                                       
+
+Assumptions behind this budget:
+  - The paper filtered offline with MATLAB; zero-phase filtering (sosfiltfilt) needs the future signal,
+    so the device must use a causal filter (sosfilt). That changes the signal slightly; re-validate
+    accuracy with causal filtering before deploying.
+  - The paper used the database's R-peak annotations. A device needs its own R-peak detector
+    (budgeted above); detector errors are not reflected in the replication's accuracy.
+  - 'Post-RR' and 'RR local average' (5 RR intervals after the beat) mean each beat is classified
+    ~6 beats (~5 s) after it occurs; the pending-vector queue above holds those beats.
+  - 'RR average' (whole-record mean) becomes a running mean; 'IR time' (feature 35, R time in the
+    record) is not meaningful in continuous monitoring and should be dropped (the no_feature35
+    ablation shows <= 0.2 pp change for LR).
+  - Program code (filter + detector + fiducials + features + LR) is estimated at 20-60 KB of flash.
+
+Compute per beat (analytic): baseline filter 2 biquads x 5 MACs = 10 MACs/sample (3,600 MAC/s at
+360 Hz); fiducial detection + features ~10-20 k simple ops per beat; LR 285 MACs (57 F) / 100 MACs (20 F) + 5 exp. At 240 MHz this is well under 1 ms per beat.
+
+====================================================================================================
+6. TARGET-BY-TARGET VERDICT
+====================================================================================================
+Target                        Recommended runtime                                 Memory need vs budget  Verdict
+----------------------------  ---------------------------------  --------------------------------------  -------
+ESP32 (WROOM-32, no PSRAM)    C, float32, static buffers (20 F)     9.56 KB of 160.00 KB budget (6.0 %)  fits   
+ESP32-S3 (8 MB PSRAM)         C, float32, static buffers (20 F)     9.56 KB of 256.00 KB budget (3.7 %)  fits   
+Raspberry Pi Zero 2 W         Python + NumPy only                 37.11 MB of 300.00 MB budget (12.4 %)  fits   
+Raspberry Pi 4/5 (2 GB)       Python + scikit-learn                157.83 MB of 1.46 GB budget (10.5 %)  fits   
+Cloud (small instance, 1 GB)  Python + scikit-learn              157.83 MB of 700.00 MB budget (22.5 %)  fits   
+
+Notes per target:
+  - ESP32 (WROOM-32, no PSRAM): 520 KB SRAM total; ~160 KB is a conservative heap budget with Wi-Fi/BLE running; FPU is single-precision only (double is software-emulated).
+  - ESP32-S3 (8 MB PSRAM): 512 KB SRAM + PSRAM; budget counts internal SRAM only.
+  - Raspberry Pi Zero 2 W: 512 MB RAM shared with the OS; ~300 MB left for an application.
+  - Raspberry Pi 4/5 (2 GB): smallest common Pi 4/5 RAM size.
+  - Cloud (small instance, 1 GB): e.g. the smallest general-purpose VM / container size.
+
+  Cloud: memory is a non-issue for LR. Batch inference on the whole 49,825-beat test set and LR
+  training both stay within the RSS figures of sections 3-4. The cloud is the natural place to train the teacher/student
+  and to run batch re-analysis.
+  Raspberry Pi: any model in this study fits. Prefer the NumPy-only float32 runtime (no sklearn import)
+  on a Pi Zero 2 W to keep RSS and start-up time low; feature extraction then dominates CPU time, not
+  memory.
+  ESP32: LR fits with large headroom (<10 % of a conservative SRAM budget) even with all 57 features.
+  The real porting work is in the signal chain (causal filter, R-peak detector, fiducial rules in C),
+  not the classifier.
+
+====================================================================================================
+7. KNOWLEDGE DISTILLATION SIZING
+====================================================================================================
+Model                                                   Parameters    float32       int8                MACs / beat
+------------------------------------------------------  ----------  ---------  ---------  -------------------------
+LR, 57 F (student or teacher)                                  290    1.13 KB      290 B                        285
+MLP (100 hidden, sklearn default), 57 F                      6,305   24.63 KB    6.16 KB                      6,200
+LR, 20 F (student or teacher)                                  105      420 B      105 B                        100
+MLP (100 hidden, sklearn default), 20 F                      2,605   10.18 KB    2.54 KB                      2,500
+SVM RBF (measured on DS1), 20 F: 4,710 support vectors     113,050  441.60 KB  110.40 KB  989,100 (OvO, worst case)
+
+Soft-label (teacher output) storage for a distillation transfer set, float32 x 5 classes:
+  DS1 training set (51,528 beats): 1006.41 KB;  all 44 records (101,356 beats): 1.93 MB
+  (float16 halves this; storing top-1 + max prob only needs 5 bytes per beat).
+SVM support vectors per class: {'N': 2092, 'S': 836, 'V': 1411, 'F': 363, 'Q': 8} (fit 9 s).
+
+LR as STUDENT: the obvious role. It is the cheapest model that fits every target, and a teacher can
+  pass on soft class probabilities. Caveat: sklearn's LogisticRegression cannot train on soft labels;
+  a small custom softmax-regression trainer (NumPy or PyTorch, same 5 x F weights, cross-entropy
+  against teacher probabilities, temperature T) is needed. Memory for that training is the same as
+  in section 4 plus the soft-label array above.
+LR as TEACHER: only sensible for an even smaller student (e.g. int8 LR, fewer features, or a
+  distilled rule set). Note that in the replication LR is weaker than MLP/SVM when patients overlap,
+  and all models are weak on unseen patients (DS2: S sensitivity < 15 %). Distillation transfers the
+  teacher's mistakes too, so the teacher should be the best patient-level model available.
+Teacher candidates on the targets: an MLP teacher (~25 KB float32 for 57 F) would itself fit an
+  ESP32; an RBF-SVM teacher is dominated by its support vectors (see the table) and is cloud/Pi only.
+
+Accuracy context (patient-level DS1/DS2 test, this exact model): see section 2, float64 row. The
+memory analysis shows LR is deployable everywhere; whether it is accurate enough to deploy is a
+separate question (see README, 'Feasibility').
