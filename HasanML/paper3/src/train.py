@@ -85,6 +85,42 @@ def to_categorical(y: np.ndarray, n_classes: int) -> np.ndarray:
     return tf.keras.utils.to_categorical(y, num_classes=n_classes).astype(np.float32)
 
 
+class MacroF1Callback:
+    """
+    Keras callback that computes macro-F1 on the validation set at each epoch
+    and stores it in logs as 'val_macro_f1'.  Used to drive EarlyStopping when
+    val_loss is a poor signal (e.g. heavily imbalanced data where N dominates).
+    """
+    def __new__(cls, X_ecg_val, X_rr_val, y_val, n_classes):
+        # Delay importing keras so this module loads without TF installed.
+        from tensorflow import keras
+
+        class _CB(keras.callbacks.Callback):
+            def __init__(self, X_ecg_val, X_rr_val, y_val, n_classes):
+                super().__init__()
+                self._Xe = X_ecg_val
+                self._Xr = X_rr_val
+                self._y  = y_val
+                self._K  = n_classes
+
+            def on_epoch_end(self, epoch, logs=None):
+                y_pred = np.argmax(
+                    self.model.predict([self._Xe, self._Xr], verbose=0), axis=1
+                )
+                f1s = []
+                for c in range(self._K):
+                    tp = np.sum((self._y == c) & (y_pred == c))
+                    fp = np.sum((self._y != c) & (y_pred == c))
+                    fn = np.sum((self._y == c) & (y_pred != c))
+                    p  = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    r  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1s.append(2 * p * r / (p + r) if (p + r) > 0 else 0.0)
+                if logs is not None:
+                    logs["val_macro_f1"] = float(np.mean(f1s))
+
+        return _CB(X_ecg_val, X_rr_val, y_val, n_classes)
+
+
 # %%
 def train_one(
     cfg:          dict,
@@ -146,9 +182,22 @@ def train_one(
     y_tr_oh  = to_categorical(y_tr,  n_classes)
     y_val_oh = to_categorical(y_val, n_classes)
 
+    # When class weights are used, val_loss is unweighted (Keras limitation) so
+    # it stays dominated by N and triggers early stopping before minority classes
+    # are learned.  Switch to macro-F1 on val set as the early stopping signal.
+    use_balanced = str(t_cfg.get("class_weight", "none")) == "balanced"
+    es_monitor = "val_macro_f1" if use_balanced else "val_loss"
+    es_mode    = "max"          if use_balanced else "min"
+
+    macro_f1_cb = (
+        MacroF1Callback(X_ecg_val, X_rr_val, y_val, n_classes)
+        if use_balanced else None
+    )
+
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_loss",
+            monitor=es_monitor,
+            mode=es_mode,
             patience=int(t_cfg["early_stop_patience"]),
             restore_best_weights=bool(t_cfg["restore_best_weights"]),
             verbose=0,
@@ -161,6 +210,8 @@ def train_one(
             verbose=0,
         ),
     ]
+    if macro_f1_cb is not None:
+        callbacks.append(macro_f1_cb)
 
     t0 = time.perf_counter()
     history = model.fit(
