@@ -622,7 +622,9 @@ def main(argv=None) -> None:
         cfg_p1 = {k: dict(v) if isinstance(v, dict) else v for k, v in cfg.items()}
         cfg_p1["input"]    = {**cfg["input"],    "mode": "derivative", "nk": 32}
         cfg_p1["task"]     = {**cfg["task"],     "init": "mf_trainable"}
-        cfg_p1["training"] = {**cfg["training"], "class_weight": "none"}
+        # Honour explicit --class-weight CLI flag; default to "none" (paper Model 6)
+        cli_cw = cfg["training"].get("class_weight", "none")
+        cfg_p1["training"] = {**cfg["training"], "class_weight": cli_cw}
 
         # Recompute kernel_mf for P1 config
         kernel_p1 = templates_to_kernel(templates, sub_classes,
