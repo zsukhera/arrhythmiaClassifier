@@ -1,7 +1,7 @@
 # FYP Progress
 
 **Zain Ul Arifeen Sukhera**
-**Last updated: 2026-11-08**
+**Last updated: 2026-11-13**
 
 ---
 
@@ -231,13 +231,49 @@ Full PyTorch implementation of the KAN-Former-1D teacher model for 5-class AAMI 
 
 ---
 
+### Farag 2023 — P1 training run (2026-11-13)
+
+Ran on university GPU lab (Precision 3680, CPU-only — CUDA drivers not installed). Python 3.14.4, TF 2.22.0rc0.
+
+**Bugs found and fixed:**
+- `run_experiment.py`: `DS1` undefined in template fallback — fixed to `DS1_TRAIN + DS1_VAL`
+- `run_experiment.py`: `--class-weight` CLI flag ignored for P1 (hardcoded to `none`) — fixed to honour CLI
+- `train.py`: EarlyStopping monitored `val_loss` (unweighted in Keras) — dominated by N class (90% of data), triggered at ~27 epochs before minority classes could be learned. Fixed by adding `MacroF1Callback` and switching to `val_macro_f1` when `class_weight=balanced`
+- `requirements.txt`: added `pytest`, bumped `tensorflow>=2.22` for Python 3.14 compat
+
+**Run 1 — no class weights (paper Model 6 as written):**
+
+| Metric | Ours | Paper target |
+|--------|------|-------------|
+| OvR accuracy | 95.56% | 98.18% |
+| Macro F1 | 54.32% | 92.17% |
+| Se_S | 0.00% | 85.3% |
+| Se_V | 57.32% | 96.34% |
+
+Root cause: DS1-train has only 149 S beats (0.59% of training data). Without class weights the model never predicts S. Paper's claim of Se_S=85.3% with no class weights is not reproducible.
+
+**Run 2 — balanced class weights + macro-F1 early stopping (in progress, 2026-11-13):**
+
+Final results (10 seeds, all 500 epochs, ~285 s/seed, ~48 min total):
+
+| Metric | Ours | Paper target |
+|--------|------|-------------|
+| OvR accuracy | 93.99 ± 0.36% | 98.18% |
+| Plain accuracy | 90.98 ± 0.54% | — |
+| Se_S | 35.01% | 85.3% |
+| Se_V | 86.71% | 96.34% |
+
+Se_S recovered from 0% → 35% (seed range 15%–52% — high variance due to only 149 S training beats). Gap from paper remains. The paper's claimed Se_S=85.3% with no class weights is not reproducible; achieving it requires balanced class weights and even then is limited by training data size.
+
+---
+
 ## Left to do
 
 ### ML pipeline
 
 - [ ] **Re-run full pipeline** after normalisation fixes: `features.py` → `split.py` → `train.py` → `evaluate.py`
 - [ ] **Verify DS1/DS2 recovery** — LBBB and RBBB F1 should recover from ~0 to meaningful values; target accuracy approaching paper's 0.989
-- [x] **Farag 2023 1D-CNN** (`HasanML/paper3/`) — full replication with TFLite/ESP32 export; 34 tests pass. This doubles as the ESP32 student model candidate. **Run P1 to get DS2 numbers.**
+- [x] **Farag 2023 1D-CNN** (`HasanML/paper3/`) — full replication with TFLite/ESP32 export; 34 tests pass. P1 training run on university GPU (2026-11-13); see results below.
 - [ ] **LSTM baseline** — input shape `(N, 720, 2)`
 - [x] **KAN-Former (teacher)** (`HasanML/paper4/`) — PyTorch, 2-branch CNN + Transformer + KAN head; ~1M params; cloud-only. Full implementation complete: 14 source files, 34+ unit tests, Colab notebook, bash script, distillation export. **Run GPU training to get DS2 numbers.**
 - [ ] **Knowledge distillation** — freeze KAN-Former (or paper3 1D-CNN if it's the better teacher); train Keras student in paper3 with `L = α·CE + (1−α)·KL`. Soft labels saved by teacher at T∈{1,2,4} as `results/teacher/soft_labels_T{t}.npy`.

@@ -4,8 +4,8 @@
 
 # ============================================
 
+CLAUDE.md
 # Ignore the downloaded MIT-BIH dataset
-
 /datasets/mitbih/mitdb/
 
 # Ignore downloaded/archive dataset files anywhere

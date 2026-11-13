@@ -1849,4 +1849,63 @@ We also need to try De Chazal's paper
 
     The paper you're re-implementing (CLARITY-AI 2.0) adopted the N/L/R/V/A scheme but
      likely used a random split, so they never exposed this problem.
+
+─────────────────────────────────────────────────────────────────────────────────────
+Farag 2023 1D-CNN (HasanML/paper3) — P1 Training Results
+//Zain 13-11-2026
+─────────────────────────────────────────────────────────────────────────────────────
+
+AAMI CLASSES USED:
+Yes. The 1D-CNN maps MIT-BIH symbols to 3 AAMI classes before training:
+  N (Normal)  ← MIT-BIH symbols: N, L, R, e, j
+  S (SVEB)    ← MIT-BIH symbols: A, a, J, S   (supraventricular ectopic beats)
+  V (VEB)     ← MIT-BIH symbols: V, E          (ventricular ectopic beats)
+F and Q beats are dropped entirely in the 3-class P1 configuration.
+This is the standard AAMI EC57 inter-patient benchmark (de Chazal 2004 split).
+
+METRIC DEFINITIONS:
+  Plain accuracy  = correct / total beats  (standard multiclass accuracy)
+  OvR accuracy    = 1 - (2 × error_rate / K)  where K = number of classes
+                  = mean of per-class binary accuracies
+                  For K=3: OvR is always higher than plain accuracy.
+                  The paper reports OvR as "average accuracy" — this is why
+                  their 98.18% looks high. Equivalent plain accuracy ≈ 97.27%.
+
+  Se_S = Sensitivity for class S = fraction of actual S beats correctly detected
+  Se_V = Sensitivity for class V = fraction of actual V beats correctly detected
+  These are the clinically important metrics. Se_V matters most (ventricular =
+  dangerous). Both are highlighted in the paper and in the AAMI EC57 standard.
+
+DS1/DS2 SPLIT:
+  DS1-train (12 records < 200): training data  — N=23,932  S=149   V=1,234
+  DS1-val   (10 records ≥ 200): early stopping — N=21,934  S=795   V=2,554
+  DS2       (22 records):       final test      — N=44,259  S=1,837 V=3,221
+  Note: S is only 0.59% of DS1-train — severe class imbalance.
+
+BUGS FOUND AND FIXED (13-11-2026):
+  1. DS1 undefined in template fallback → fixed to DS1_TRAIN + DS1_VAL
+  2. --class-weight CLI flag ignored for P1 (hardcoded to none) → fixed
+  3. EarlyStopping monitored val_loss (unweighted in Keras) → dominated by N,
+     triggered at ~27 epochs. Fixed: added MacroF1Callback, switch to
+     val_macro_f1 when class_weight=balanced.
+  4. requirements.txt: added pytest, bumped tensorflow>=2.22 (Python 3.14 compat)
+
+RESULTS SUMMARY (DS2, 10 seeds, all 500 epochs, ~48 min on CPU):
+
+  Run                     OvR Acc   Plain Acc   Se_S    Se_V
+  ──────────────────────────────────────────────────────────
+  No class weights        95.56%    93.33%       0.0%   57.3%
+  Balanced class weights  93.99%    90.98%      35.0%   86.7%
+  Paper target (Model 6)  98.18%    ~97.3%      85.3%   96.3%
+
+ANALYSIS:
+  - Paper claims Se_S=85.3% with NO class weights — not reproducible.
+    Root cause: only 149 S beats in DS1-train (0.59%). Model ignores S entirely.
+  - With balanced class weights + macro-F1 early stopping:
+    Se_S jumps to 35% (seed range 15–52% — high variance due to data scarcity).
+    Se_V improves from 57% to 87%.
+  - Remaining gap to paper target is due to limited S training data (149 beats).
+    The paper likely used implicit balancing or a different data split.
+  - The model runs full 500 epochs with macro-F1 early stopping (~285 s/seed CPU).
+  - No CUDA drivers on university GPU lab machine — ran on CPU only.
      "
