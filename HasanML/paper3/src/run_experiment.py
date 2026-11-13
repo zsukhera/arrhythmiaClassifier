@@ -531,7 +531,7 @@ def main(argv=None) -> None:
     template_segs_tr  = build_template_data(DS1_TRAIN, cfg)
     template_segs_all = None
     if cfg["templates"].get("source") == "ds1_train":
-        template_segs_all = build_template_data(DS1, cfg)   # for fallback
+        template_segs_all = build_template_data(DS1_TRAIN + DS1_VAL, cfg)   # for fallback
 
     sub_classes  = list(cfg["templates"]["sub_classes"])
     nk           = int(cfg["input"]["nk"])

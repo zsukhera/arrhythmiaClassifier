@@ -11,7 +11,9 @@ tqdm
 #   pip install tensorflow[and-cuda]   (Linux, TF 2.12+)
 # On Colab, TF is pre-installed; just upgrade if needed:
 #   pip install --upgrade tensorflow
-tensorflow>=2.10
+# Note: Python 3.14 requires tensorflow>=2.22 (2.22.0rc0 confirmed working)
+tensorflow>=2.22
 tensorflow-model-optimization
 xgboost
 threadpoolctl
+pytest
