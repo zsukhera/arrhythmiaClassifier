@@ -1,0 +1,139 @@
+# KAN-Former: Inter-patient ECG Heartbeat Classifier
+# Cloud TEACHER model for knowledge distillation into the ESP32 1D-CNN student.
+#
+# Architecture adapted from:
+#   K. Wang et al., "KAN-Former: a lightweight ECG model for real-time AF
+#   detection on wearable devices," Front. Bioeng. Biotechnol., 2026.
+# Applied to MIT-BIH beat-level classification with de Chazal DS1/DS2 split.
+#
+# Every DEFAULT/ABLATION setting is documented with its justification.
+# DS2 is NEVER used for any tuning decision — only final reporting.
+
+seeds: [0, 1, 2, 3, 4]       # 5 seeds; ensemble of all 5 is the actual teacher
+
+data:
+  data_dir: data/mitdb                        # relative to HasanML/paper4/
+  local_mirrors:
+    - ../../datasets/mitbih/mitdb             # pre-cached local copy
+    - ../paper3/data/mitdb                    # paper3 may have already downloaded
+  lead: MLII                                  # MLII by name; record 114 has swapped leads
+  fs: 360                                     # 360 Hz; teacher runs in cloud, no resampling
+  exclude_records: ["102", "104", "107", "217"]  # paced records (de Chazal Table 2)
+  classes: 5                                  # DEFAULT: N,S,V,F,Q
+
+preprocess:
+  # Beat window: 256 samples @ 360 Hz = 0.711 s, covering P-QRS-T
+  beat_before_r: 90                           # samples before R peak
+  beat_after_r: 166                           # samples after R peak
+  beat_len: 256                               # = beat_before_r + beat_after_r
+
+  # Context window: 1080 samples @ 360 Hz = 3 s, centred (540+540)
+  # Gives neighbouring beats for attention: S beats have early P waves or
+  # compensatory pauses; V beats have altered post-ectopic RR patterns.
+  context_len: 1080                           # DEFAULT; ABLATION: 720 (2 s) or 0 (no context)
+  context_half: 540                           # = context_len // 2
+
+  # Bandpass removes baseline wander (< 0.5 Hz) and powerline (> 40 Hz).
+  # Match the 1D-CNN student so distillation inputs are comparable.
+  filter: bandpass                            # DEFAULT; ABLATION: none
+  bandpass_low_hz: 0.5
+  bandpass_high_hz: 40.0
+  bandpass_order: 4
+
+  # Z-score per-window removes inter-patient amplitude differences — the main
+  # cause of DS2 generalisation failure when using global/record normalisation.
+  normalisation: zscore                       # zscore | none
+
+rr:
+  # 6 ratio features (absolute RR hurts inter-patient results; ratios are
+  # patient-agnostic).  All computed from ALL annotated beats so intervals
+  # never skip over a filtered beat.
+  local_window: 10                            # beats in local mean (prompt: last 10)
+  global_window: 400                          # beats in global mean (last 400)
+  n_features: 6                               # pre/local, post/local, pre/global, post/global,
+                                              # pre/post, (post-pre)/local
+
+model:
+  d_model: 128                                # Transformer hidden dim; matches CNN output
+  n_heads: 4                                  # attention heads (d_head = 32)
+  n_layers: 3                                 # Transformer encoder layers
+  ffn_hidden: 256                             # GLU FFN hidden units (each gate half = 256)
+  dropout: 0.1                                # attention / FFN dropout
+  stoch_depth: 0.1                            # stochastic depth per layer
+  cnn_channels: [32, 64, 128]                 # channel widths after each MS block
+  ms_kernels: [3, 7, 15]                      # multi-scale Conv1d kernels (1D MS-CA)
+  se_reduction: 8                             # Squeeze-and-Excitation reduction factor
+  head: kan                                   # kan | mlp (ablation A1)
+  kan_grid_size: 5                            # B-spline grid intervals (ablation A6: 3 or 8)
+  kan_spline_order: 3                         # cubic B-splines
+  kan_grid_range: [-1.0, 1.0]                 # inputs squeezed into this range by tanh
+  kan_hidden: 64                              # KAN head hidden dimension
+  head_dropout: 0.2                           # dropout between KAN layers
+
+training:
+  # Focal loss with sqrt(1/freq) class weights avoids both the imbalance
+  # and the over-correction of full inverse-frequency weights.
+  loss: focal                                 # focal | weighted_ce | ce | label_smooth
+  focal_gamma: 2.0                            # (1-pt)^gamma; gamma=2 focuses on hard examples
+  label_smooth_eps: 0.05                      # only used when loss=label_smooth
+  sampler: balanced                           # balanced (capped at 30% S/V) | natural
+  s_cap: 0.30                                 # max fraction of S beats per batch
+  v_cap: 0.30                                 # max fraction of V beats per batch
+  batch_size: 256
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 5
+  max_epochs: 100
+  grad_clip: 1.0
+  ema_decay: 0.999
+  early_stop_patience: 15                     # on DS1-val MACRO-F1 (not val_loss)
+  mixed_precision: true                       # torch.amp on CUDA
+
+augmentation:
+  # Applied to training beats only, each transform with p=0.5.
+  # Simulate inter-patient variability to improve DS2 generalisation.
+  enabled: true
+  amplitude_range: [0.8, 1.2]
+  noise_snr_db: [20, 35]                      # additive Gaussian noise SNR
+  bw_freq_range: [0.1, 0.5]                   # baseline wander sine frequency (Hz)
+  bw_amp_max: 0.1                             # BW amplitude as fraction of window std
+  time_shift: 10                              # max shift in samples (±10)
+  stretch_range: [0.9, 1.1]                   # time-stretch ratio
+  rr_jitter: 0.03                             # ±3% jitter on RR ratio features
+
+calibration:
+  # Temperature scaling: fit T on DS1-val to minimise NLL (Platt-style).
+  # Required for distillation: logits / T at T>1 are softer labels.
+  enabled: true
+  method: temperature                         # only temperature scaling supported
+  T_init: 1.5
+  T_max_iter: 200
+
+distillation:
+  # Soft labels saved for every DS1 beat (train + val), indexed by beat_index.csv.
+  # The student (paper3 Keras CNN) loads them regardless of framework.
+  temperatures: [1, 2, 4]
+  save_ds2: true                              # also save DS2 soft labels (analysis only)
+
+export:
+  onnx: true
+  torchscript: true
+
+search:
+  # Optuna HP search (--search flag); 40 trials on DS1 GroupKFold macro-F1.
+  n_trials: 40
+  n_folds: 5
+  objective: macro_f1
+
+compute:
+  device: auto                                # auto | cpu | cuda | gpu
+  mixed_precision: true                       # float16 AMP on GPU
+  deterministic: true                         # torch.use_deterministic_algorithms(True)
+  dataloader_workers: 4                       # DataLoader num_workers
+
+output:
+  results_dir: results
+  cache_dir: results/cache
+  figures_dir: results/figures
+  teacher_dir: results/teacher

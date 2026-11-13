@@ -1,0 +1,165 @@
+===========================================================================
+How to run paper4 — KAN-Former-1D (PyTorch teacher model)
+===========================================================================
+
+Directory: HasanML/paper4/
+Language:  Python 3.10+ / PyTorch
+Task:      5-class AAMI ECG arrhythmia classification (teacher for distillation)
+Dataset:   MIT-BIH (auto-downloaded via wfdb from PhysioNet)
+Split:     de Chazal DS1/DS2 inter-patient (22 + 22 patients)
+
+---------------------------------------------------------------------------
+QUICKEST START — bash wrapper
+---------------------------------------------------------------------------
+
+From anywhere in the fyp repo:
+
+  bash 1DCNN/run_paper4.sh tests          # unit tests (CPU, ~15 s)
+  bash 1DCNN/run_paper4.sh sanity         # RR LightGBM sanity check (~2 min)
+  bash 1DCNN/run_paper4.sh train          # 3-seed CPU training
+  bash 1DCNN/run_paper4.sh gpu            # 3-seed GPU training + distillation
+  bash 1DCNN/run_paper4.sh ablations      # 7 ablations A1-A6b (slow)
+  bash 1DCNN/run_paper4.sh distill        # export soft labels (requires trained model)
+
+---------------------------------------------------------------------------
+STEP-BY-STEP MANUAL SETUP
+---------------------------------------------------------------------------
+
+1. Create and activate a virtual environment (paper4-specific):
+
+   cd HasanML/paper4
+   python -m venv .venv
+   source .venv/bin/activate        # Linux / macOS / WSL
+   .venv\Scripts\activate           # Windows
+
+2. Install PyTorch:
+
+   # GPU (CUDA 12.x — RTX 4000 Ada / Ampere):
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+   # CPU only (slower, but all tests and training work):
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+3. Install other dependencies:
+
+   pip install -r requirements.txt
+
+4. Run unit tests (verify everything is working):
+
+   python -m pytest tests/ -v
+
+   Expected: 34+ tests pass in ~30 s on CPU.
+
+---------------------------------------------------------------------------
+TRAINING
+---------------------------------------------------------------------------
+
+From HasanML/paper4/:
+
+  # 5-class AAMI, 3 seeds, CPU (slow ~3-4 h)
+  python -m src.run_experiment --classes 5 --seeds 3
+
+  # GPU with mixed precision (recommended for RTX / A100 / T4)
+  python -m src.run_experiment --classes 5 --seeds 3 --device cuda --mixed-precision
+
+  # Custom results directory
+  python -m src.run_experiment --classes 5 --seeds 3 --device cuda --results-dir results/my_run
+
+  # Save results every seed (default behaviour — checkpoints .pkl + .pt)
+
+Outputs in results/ (or --results-dir):
+  results_seed{N}.json        — per-seed metrics
+  model_seed{N}.pt            — model state_dict + ema_shadow + config
+  summary.json                — mean ± std across seeds
+
+---------------------------------------------------------------------------
+DISTILLATION SOFT LABELS
+---------------------------------------------------------------------------
+
+After training completes:
+
+  python -m src.run_experiment --distill --results-dir results/
+
+Outputs in results/distill/:
+  soft_labels_ds2_T1.npy      — (N_DS2, 5) teacher probs at T=1
+  soft_labels_ds2_T2.npy      — (N_DS2, 5) teacher probs at T=2  ← use for distillation
+  soft_labels_ds2_T4.npy      — (N_DS2, 5) teacher probs at T=4
+  soft_labels_ds1_T{1,2,4}.npy — same for DS1 (for student's training set)
+  beat_index_ds2.csv          — record, r_sample, symbol, aami_label
+  model_ensemble.onnx         — ONNX model for inference in any framework
+  model_ensemble.ts           — TorchScript model
+
+The student (paper3 Keras 1D-CNN) loads the .npy files directly.
+
+---------------------------------------------------------------------------
+ABLATIONS
+---------------------------------------------------------------------------
+
+  python -m src.run_experiment --ablations --seeds 3 --device cuda
+
+Runs 7 ablations:
+  A1  — MLP head (replace KAN with standard MLP)
+  A2  — No Transformer (CNN + KAN only, no attention)
+  A3  — No context window (beat morphology only)
+  A4  — No RR features
+  A5  — Single kernel k=7 (remove multi-scale)
+  A6a — KAN grid_size=3  (coarser spline)
+  A6b — KAN grid_size=8  (finer spline)
+
+Results written to results/ablation_{name}/ directories.
+
+---------------------------------------------------------------------------
+COLAB (cloud GPU)
+---------------------------------------------------------------------------
+
+Open HasanML/paper4/colab_paper4.ipynb in Google Colab.
+Set Runtime → Change runtime type → T4 GPU.
+Run all cells top-to-bottom (Drive mount → install → tests → train → distill).
+
+---------------------------------------------------------------------------
+IMPORTANT NOTES
+---------------------------------------------------------------------------
+
+• MIT-BIH data auto-downloads on first run via wfdb (~100 MB total).
+  To pre-download all 44 records: set PREDOWNLOAD=True in colab cell 5,
+  or run: python -c "import wfdb; wfdb.dl_database('mitdb', dl_dir='data/mitbih')"
+
+• The model uses BOTH beat (256 samples) and context (1080 samples) windows.
+  Context window requires 360 Hz ECG — do NOT downsample before passing to paper4.
+  (paper3 student uses 128 Hz; they are intentionally different.)
+
+• Paced records (102, 104, 107, 217) are excluded from training/evaluation.
+  DS1/DS2 split is identical to paper3 for fair comparison.
+
+• Mixed precision (--mixed-precision) requires CUDA 12 + torch ≥ 2.0.
+  On RTX 4000 Ada (sm_89, Ada Lovelace), torch ≥ 2.1 is needed for full support.
+
+• Early stopping uses macro-F1 on DS1-val (patience=20 epochs, min_delta=0.001).
+  Best EMA checkpoint is saved and used for DS2 evaluation.
+
+• Temperature calibration is done on DS1-val logits (after training).
+  Calibrated soft labels are saved at T={1,2,4} for the distillation pipeline.
+
+---------------------------------------------------------------------------
+TARGET METRICS (DS2, inter-patient)
+---------------------------------------------------------------------------
+
+  Accuracy      ≥ 95%
+  OvR accuracy  ≥ 97%
+  Se_N          ≥ 98%
+  Se_S          ≥ 70%   ← key difficulty (supraventricular ectopic)
+  Se_V          ≥ 90%   ← key clinical metric (ventricular ectopic)
+  Macro F1      ≥ 80%
+
+See results/paper_targets.md for full ablation expectations.
+
+---------------------------------------------------------------------------
+PARAMETER COUNT
+---------------------------------------------------------------------------
+
+  ~1.0 M parameters total:
+  - MS-CA CNN stems (beat + context): ~300K
+  - 3× Transformer layers (d_model=128): ~490K
+  - KAN head (262→64→5): ~155K
+
+---------------------------------------------------------------------------

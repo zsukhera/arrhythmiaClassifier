@@ -1,0 +1,17 @@
+numpy
+scipy
+wfdb
+scikit-learn
+pandas
+matplotlib
+pyyaml
+tqdm
+# TensorFlow — Colab ships TF 2.x; local install needs GPU variant separately.
+# To install locally with GPU support:
+#   pip install tensorflow[and-cuda]   (Linux, TF 2.12+)
+# On Colab, TF is pre-installed; just upgrade if needed:
+#   pip install --upgrade tensorflow
+tensorflow>=2.10
+tensorflow-model-optimization
+xgboost
+threadpoolctl

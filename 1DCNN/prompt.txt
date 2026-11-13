@@ -1,0 +1,333 @@
+================================================================================
+CLAUDE CODE PROMPT: Replicate Farag (2023) tiny matched-filter 1D-CNN for
+inter-patient AAMI heartbeat classification on MIT-BIH, and extend it to binary
+(normal vs arrhythmia) classification, with ESP32-oriented export
+================================================================================
+
+Paste everything below this line into Claude Code.
+--------------------------------------------------------------------------------
+
+## Goal
+
+Replicate:
+
+  M. M. Farag, "A Tiny Matched Filter-Based CNN for Inter-Patient ECG
+  Classification and Arrhythmia Detection at the Edge," Sensors, vol. 23,
+  no. 3, art. 1365, 2023, doi: 10.3390/s23031365.
+  https://www.mdpi.com/1424-8220/23/3/1365
+
+The paper classifies single MIT-BIH heartbeats into AAMI classes using the
+de Chazal DS1/DS2 inter-patient split (train on DS1 patients, test on DS2
+patients). The model is very small (about 1.3k-1.6k parameters, about 15 KB as
+TFLite):
+
+  ECG beat (MLII, 128 Hz, 64 samples, optionally its first derivative)
+    -> Conv1D with 13 kernels initialised from class-average "matched filter"
+       templates computed on DS1
+    -> BatchNormalization -> GlobalMaxPooling1D
+    -> concatenated with a small fully-connected stack fed by dynamically
+       normalised RR-interval features
+    -> Dense softmax output (3, 4 or 5 AAMI classes)
+
+Then EXTEND it (not in the paper) with a binary task: Normal vs Arrhythmia.
+
+Several details are only in the paper's tables, which are images (Tables 1-6).
+Before writing code, open the PDF and read Tables 1-4. Wherever the text below
+says "ASSUMPTION", implement the stated default, make it configurable in
+`configs/default.yaml`, check it against the PDF tables, and list it in the
+README.
+
+Cite the paper above in the README and in each module's header comment.
+
+## Target results (DS2 test set, from the paper's text)
+
+| Model (paper ID)  | Setup                                                    | Reported |
+|-------------------|----------------------------------------------------------|----------|
+| Model 6 (best)    | 3-class N/S/V, derivative input, NK=32, MF-initialised, class weights NOT set | "average" ACC 98.18 %, avg F1 92.17 %, avg PREC 92.44 % |
+| Abstract          | best model                                               | avg SEN 91.90 %, SVEB SEN 85.3 %, VEB SEN 96.34 % |
+| Model 1           | 3-class, derivative, NK=64, default (Glorot) init        | VEB SEN 96.34 % |
+| Model 3           | 3-class, derivative, NK=32, MF init, frozen kernels      | SVEB SEN 95.59 % |
+| Model 4           | 2-channel (signal + derivative), NK=32, frozen           | best avg SEN 93.92 % |
+| Last two models   | 4-class (N,S,V,F) and 5-class (N,S,V,F,Q)                | lowest averages (F and Q hurt) |
+| RR-only XGBoost   | sanity baseline, 3-class                                 | ACC 93 %; recall N/S/V 97/60/58 % |
+
+Copy Table 4 from the PDF into `results/paper_table4.md` and use it as the
+reference. Do not tune toward these numbers on DS2.
+
+## IMPORTANT: check what "accuracy" means (verify this)
+
+The paper reports "average accuracy". In another paper we replicated
+(Yakut 2020), "accuracy" turned out to be the MEAN ONE-VS-REST accuracy,
+1 - 2e/K, not plain multiclass accuracy 1 - e. For K = 3,
+98.18 % one-vs-rest would be only 97.27 % plain accuracy.
+Implement both and report them side by side. Use Table 4's per-class numbers
+to check which definition matches, and state the result in the README.
+Always report the majority-class ("predict all N") baseline next to accuracy:
+N is about 89.5 % of DS2 beats (paper Sec 5.1), so accuracy alone says little.
+
+## Data
+
+- MIT-BIH Arrhythmia Database (PhysioNet `mitdb`), 360 Hz. Download with
+  `wfdb.dl_database` into `data/mitdb/` if it is missing. Reuse
+  `datasets/mitbih/mitdb/` if it already exists in the repo.
+- Lead: MLII only, selected by name from `sig_name` (record 114 has its leads
+  swapped).
+- Beat positions: R peaks from the `atr` annotations. Drop non-beat annotations.
+- Paced records 102, 104, 107, 217: excluded from DS1/DS2 by the de Chazal
+  scheme. Confirm against Table 2.
+
+### Split (de Chazal 2004; confirm against Table 2)
+
+  DS1 (train): 101, 106, 108, 109, 112, 114, 115, 116, 118, 119, 122, 124,
+               201, 203, 205, 207, 208, 209, 215, 220, 223, 230
+  DS2 (test):  100, 103, 105, 111, 113, 117, 121, 123, 200, 202, 210, 212,
+               213, 214, 219, 221, 222, 228, 231, 232, 233, 234
+
+Validation inside DS1 (paper Sec 5.3): "Record numbers less than 200 are used
+for model training, while the remaining are used for model validation."
+  DS1-train = DS1 records < 200 (12 records)
+  DS1-val   = DS1 records >= 200 (10 records)
+DS2 is used ONLY for the final test. It is never used for templates,
+normalisation statistics, class weights, early stopping, thresholds, or model
+choice.
+
+### Label mapping (ANSI/AAMI EC57; confirm against Table 1)
+
+| AAMI | MIT-BIH symbols |
+|------|-----------------|
+| N    | N, L, R, e, j   |
+| S    | A, a, J, S      |
+| V    | V, E            |
+| F    | F               |
+| Q    | /, f, Q         |
+
+Class sets (`--classes`):
+  3 = N, S, V (F and Q beats dropped, paper's best setting)
+  4 = N, S, V, F
+  5 = N, S, V, F, Q
+Print a table of beat counts per class for DS1-train, DS1-val and DS2, next to
+the paper's Table 2 counts.
+
+### Binary task (OUR EXTENSION, not in the paper)
+
+Implement `--task binary` with two label definitions (`--binary-def`):
+  aami (default): Normal = AAMI N (N, L, R, e, j); Arrhythmia = S, V, F (and Q
+       if kept). Matches the AAMI scheme used in the literature.
+  raw:  Normal = MIT-BIH symbol 'N' only; Arrhythmia = every other beat
+        (L, R count as arrhythmia). Matches our earlier LightGBM binary task
+        (train_binary.py), so the two can be compared.
+Produce binary results in two ways and report both:
+  (a) Dedicated binary model: the same architecture with a 2-unit softmax,
+      trained on binary labels. The MF templates stay the 13 sub-class
+      templates.
+  (b) Collapsed multiclass model: take the 3-class model and use
+      P(arrhythmia) = 1 - P(N).
+For both, pick the decision threshold on DS1-val by maximising F1 of the
+Arrhythmia class, and also report results at a threshold of 0.5. Report
+sensitivity, specificity, PPV, F1, ROC-AUC, PR-AUC and the confusion matrix.
+
+## Preprocessing (paper Sec 3, 5.2)
+
+- The paper feeds RAW MLII with no filtering during training. Implement a
+  `--filter {none, bandpass}` option. Default `none` (paper-faithful). The
+  `bandpass` ablation is 0.5-40 Hz 4th-order Butterworth, zero-phase, matching
+  our preprocess.py.
+- Resample 360 Hz -> 128 Hz with `scipy.signal.resample_poly(x, 16, 45)`.
+  Map R-peak indices with round(r * 128 / 360). ASSUMPTION: the paper does not
+  say which resampling method it used.
+- Segment: 64 samples (0.5 s) centred on the R peak. ASSUMPTION: 32 samples
+  before the R peak and 32 after.
+- Short/edge beats: "Heartbeat segments with intervals less than 0.5 s are
+  edge-padded". ASSUMPTION: if the window would cross the record start or end,
+  pad with the edge value (np.pad mode="edge"). Log how many beats were padded.
+  Do NOT drop them: the paper keeps all annotated beats.
+- Normalisation. ASSUMPTION: subtract the per-segment mean (the paper times a
+  "mean" step in MF computation, Sec 5.2). Make `z-score` and `none` options.
+- First derivative: np.diff of the normalised segment, then edge-pad to keep
+  64 samples. ASSUMPTION about length and edge handling.
+- Input variants (`--input`): signal | derivative (default, paper's best) |
+  both (2 channels, each with its own MF templates).
+- NK=32 variant: keep the central 32 samples (drop 16 from each edge)
+  (Sec 5.2).
+
+## RR features (paper Sec 3)
+
+Causal only: use past RR intervals, so the ESP32 can compute them in real time.
+- RR intervals come from ALL annotated beats, including beats that will be
+  dropped (e.g. F and Q in 3-class mode). That way an interval never jumps
+  over a dropped beat.
+- pre_RR  = time from the previous beat to this beat.
+  post_RR = time from this beat to the next beat. This adds one beat of
+  latency on the device, which the paper accepts.
+- local_mean  = moving average of the last 80 RR intervals.
+  global_mean = moving average of the last 400 RR intervals.
+  At the start of a record, average whatever history exists.
+- Features (ASSUMPTION: 4 features; the paper says "preceding and subsequent
+  RR ... normalized to the local and global RR interval means"):
+    pre_RR / local_mean, pre_RR / global_mean,
+    post_RR / local_mean, post_RR / global_mean
+- Do NOT feed absolute RR values. The paper warns they degrade accuracy.
+- Sanity check: train an XGBoost (or LightGBM) classifier on these 4 features
+  alone, 3-class. The paper reports about 93 % accuracy and recall
+  N/S/V = 97/60/58 %. If you are far off, fix the RR features before moving on.
+
+## Matched-filter templates (paper Sec 4.2, 5.2)
+
+- Compute on DS1-train ONLY. ASSUMPTION: the paper says "DS1". Using only the
+  train records avoids leaking the validation records. Run "all of DS1" as an
+  ablation.
+- One template per MIT-BIH beat sub-class present in DS1-train: the average of
+  all preprocessed segments (or derivatives, for the derivative input) of that
+  sub-class. The paper uses 13 templates. ASSUMPTION: the 13 are the
+  sub-classes N, L, R, e, j, A, a, J, S, V, E, F, Q. Confirm this against
+  Table 1 and Figure 4. Log which sub-classes exist and how many beats went
+  into each template. If a sub-class has fewer than 5 beats in DS1-train, log
+  it and fall back to "all DS1" for that template only.
+- Use the same 13 templates for 3-, 4- and 5-class models and for the binary
+  model.
+- Kernel weight layout: Keras Conv1D kernels have shape (NK, in_channels, 13).
+  Put template i in kernel[:, 0, i]. Flip each template in time only if your
+  framework convolves rather than correlates. Keras Conv1D is
+  cross-correlation, so do NOT flip. Add a unit test that checks this.
+- ASSUMPTION: scale each template to unit L2 norm, so that no single class
+  dominates GlobalMaxPooling because of amplitude.
+- Ablations from the paper: 5 templates (one per AAMI super-class) and
+  per-record templates. The paper found both worse than 13.
+
+## Model (paper Sec 4, Figure 3, Table 3; Keras / TensorFlow)
+
+  ecg_in (64 or 32, C)   C = 1 (signal or derivative) or 2 (both)
+    Conv1D(filters=13, kernel_size=NK, strides=1, padding="valid",
+           use_bias=True, activation="relu")
+    BatchNormalization()
+    GlobalMaxPooling1D()                         -> 13 values
+  rr_in (4,)
+    Dense(16, relu) -> Dense(16, relu) -> Dense(16, relu)
+  Concatenate -> Dense(n_classes, softmax)
+
+ASSUMPTIONS to check against Table 3: padding="valid"; ReLU (the paper says
+"ReLU or Tanh"); the RR stack of 3 x Dense(16). With NK = 64 this gives about
+1.6k parameters, inside the paper's stated range of 1267-1619. Print
+`model.summary()` and the parameter count for every variant. Fail loudly if a
+3-class single-channel model falls outside 1,000-2,000 parameters, and then fix
+the RR stack to match Table 3.
+
+Kernel init (`--init`): mf_trainable | mf_frozen (Conv1D trainable=False) |
+default (Glorot uniform). NK (`--nk`): 64 | 32.
+
+## Training (paper Sec 5.3, 6.1)
+
+- Loss: categorical cross-entropy. Adam with learning rate 1e-3.
+- LR schedule: ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5,
+  min_lr=1e-5). ASSUMPTION: the paper says "adaptive learning rate scheduling"
+  without details.
+- Batch size 512, max 500 epochs, EarlyStopping(monitor="val_loss",
+  patience=20, restore_best_weights=True). ASSUMPTION about the patience. The
+  paper says training rarely exceeds 100 epochs or 2 min per run.
+- Class weights (`--class-weight {none, balanced}`): balanced =
+  sklearn `compute_class_weight("balanced")` on DS1-train. ASSUMPTION about
+  the formula. The paper's best model (Model 6) used NO class weights, and
+  class weights raised minority sensitivity at the cost of precision.
+- 10 runs per configuration with seeds 0-9 (paper Sec 5.3). Report the
+  mean +/- std. Set all seeds (keras.utils.set_random_seed).
+- Run independent configurations in parallel: a process pool sized to CPU
+  cores and RAM, or sequentially on a GPU when one is available. Use
+  `--device {auto, cpu, cuda}` as in the earlier paper replications.
+
+## Experiment grid
+
+Run first (primary):
+  P1 = Model 6: classes 3, input derivative, NK 32, init mf_trainable,
+       class_weight none
+  P2 = binary aami, same config, dedicated model + collapsed P1
+  P3 = binary raw, same config
+Then the paper's grid (reproduce Table 4 as far as it is legible):
+  input {signal, derivative, both} x NK {64, 32}
+  x init {default, mf_trainable, mf_frozen} x class_weight {none, balanced},
+  with classes = 3. Also classes 4 and 5 with the P1 setup.
+Ablations: filter bandpass; templates from all of DS1; z-score normalisation;
+4 RR features vs 2 (local only).
+
+## Metrics (`src/metrics.py`)
+
+For every run, on DS2:
+- plain accuracy (1 - e), mean one-vs-rest accuracy (1 - 2e/K), and the
+  majority-class baseline
+- per class: sensitivity (recall), PPV (precision), specificity, F1, support
+- macro and weighted averages; full confusion matrix (PNG + CSV)
+- for S and V: the de Chazal / AAMI EC57 style gross statistics (Se, +P, FPR)
+- one-vs-rest ROC-AUC (macro and micro)
+Also report the same metrics on DS1-val, to show the train/test gap.
+Write `results/results_summary.md` with our numbers next to Table 4.
+Every number in it must be computed by the code.
+
+## Edge export (paper Sec 6.2) - ESP32 target
+
+For P1 and the dedicated binary model:
+- TFLite float32, float16, dynamic-range, full-integer int8 PTQ (representative
+  data = 500 DS1-train beats), and QAT int8 with
+  `tensorflow_model_optimization` (the paper used QKeras; ASSUMPTION: use
+  tfmot instead) plus 50 % magnitude pruning.
+- Evaluate every TFLite model on DS2 with the TFLite interpreter. Report the
+  accuracy and F1 drop from Keras. The paper saw more than 10 % loss for int8
+  PTQ, which QAT fixed.
+- Report the .tflite size, parameter count, and a rough tensor-arena (RAM)
+  estimate. Write `model_<variant>.h` as a C array (xxd -i style) for
+  TFLite Micro on the ESP32.
+- Document what the firmware must reproduce: the 128 Hz resampling, the
+  64-sample window, mean removal, the derivative, the RR ring buffer (400
+  entries), and the input quantisation scale and zero-point.
+
+## Code layout (match HasanML/paper1 and paper2)
+
+  HasanML/paper3/
+    README.md, requirements.txt (numpy, scipy, wfdb, scikit-learn, pandas,
+      matplotlib, pyyaml, tensorflow, tensorflow-model-optimization, xgboost),
+    configs/default.yaml (every parameter and every ASSUMPTION),
+    src/: data.py (download, labels, splits, counts), preprocess.py
+      (resample, segment, normalise, derivative), rr.py, templates.py,
+      model.py, train.py, metrics.py, export.py, run_experiment.py
+      (argparse CLI: --task {multiclass, binary} --classes {3,4,5}
+      --binary-def {aami, raw} --input --nk --init --class-weight --seeds
+      --device --filter)
+    tests/test_pipeline.py
+    results/
+Add "Index:3, directory name: paper3" with the citation above to
+HasanML/papers.txt.
+
+Write the src files so they also work as Colab notebooks: `# %%` cell
+markers, and a path fallback to Path.cwd() when __file__ is undefined.
+Comments should explain both what the code does and the concept behind it
+(e.g. why a matched filter, why GlobalMaxPooling, why causal RR
+normalisation), and justify each parameter value.
+
+## Tests (`tests/test_pipeline.py`)
+
+- No DS2 record appears in DS1-train, DS1-val, the template computation, the
+  scaler/normalisation statistics, or the class-weight computation.
+- The AAMI label mapping covers every beat symbol, and the binary aami/raw
+  definitions are correct.
+- On a synthetic RR sequence, the RR features are causal (changing a future
+  RR interval leaves earlier features unchanged, except post_RR of the
+  immediately preceding beat) and the local/global windows are 80/400.
+- Resampling maps a known R peak to the right 128 Hz index. Segments are 64
+  long, and edge-padding works at record boundaries.
+- MF initialisation: Conv1D applied to a segment equal to template i gives its
+  maximum response on filter i, with no flip.
+- The metrics module, fed a known confusion matrix, returns 1 - e and
+  1 - 2e/K correctly.
+- Every model variant's parameter count is printed and inside the expected
+  range.
+
+## Working rules
+
+- Fix all seeds. The full run must be reproducible from one command.
+- Never fit anything on DS2: templates, statistics, weights, thresholds and
+  early stopping all come from DS1 only.
+- Do not report a number you did not compute. If a result differs from the
+  paper by more than 1 percentage point, say so and list likely causes
+  (especially the accuracy definition and the ASSUMPTIONS above).
+- Build incrementally: first segments, derivatives and templates for DS1
+  (plot the 13 templates, paper Figure 4); then the RR-only XGBoost sanity
+  check; then P1; then the grid; then binary; then export.
+- Follow GenericCodingGuidelines.txt.

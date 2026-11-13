@@ -1,0 +1,321 @@
+================================================================================
+CLAUDE CODE PROMPT: Inter-patient (DS1 -> DS2) KAN-Former for MIT-BIH heartbeat
+classification, AAMI 5/4-class + binary. Cloud TEACHER model for knowledge
+distillation into the ESP32 1D-CNN student.
+================================================================================
+
+Paste everything below this line into Claude Code.
+--------------------------------------------------------------------------------
+
+## Goal and honesty note
+
+Build a KAN-Former heartbeat classifier for MIT-BIH, evaluated with the
+de Chazal inter-patient split (train on DS1 patients, test on DS2 patients).
+It is the candidate TEACHER for knowledge distillation. It will be compared
+against the cloud 1D-CNN (HasanML/paper3, Farag 2023 replication), and the
+better of the two becomes the teacher.
+
+There is NO published KAN-Former (or any KAN) result on MIT-BIH with the
+DS1/DS2 split (literature check 2026-11-07, see
+literature/kanformer_vs_cnn.md). This is therefore NOT a replication. The
+architecture is adapted from:
+
+  K. Wang, G. Wang, Z. Wu, "KAN-Former: a lightweight ECG model for real-time
+  atrial fibrillation detection on wearable devices," Front. Bioeng.
+  Biotechnol., vol. 14, art. 1824364, 2026, doi: 10.3389/fbioe.2026.1824364.
+  (AF rhythm detection on CinC 2017 / CPSC 2018 from STFT spectrograms,
+  1.16M params, 94.5 % / 94.6 % accuracy. Not MIT-BIH, not beat-level.)
+
+The training recipe borrows from the strongest inter-patient papers:
+  - Farag 2023, Sensors 23(3):1365: RR features normalised to local/global
+    means; DS1 records < 200 train / >= 200 validation. 98.18 %, S sens 85.3 %.
+  - Xia, Xiong, Wang 2023, BSPC 86:105271: 5-layer CNN + 1-block Transformer
+    encoder, inter-patient AAMI 5-class, 97.66 % (97.93 % with denoising-AE
+    pretraining on Icentia11k).
+  - Mousavi & Afghah 2019, ICASSP: a context of neighbouring beats helps S
+    beats. 99.53 %, S sens 88.9 %.
+Cite all four in the README and in module header comments.
+
+Every setting below marked DEFAULT is the recommended configuration. Settings
+marked ABLATION are tested against it. All of them are configurable in
+configs/default.yaml. Do NOT invent results, and do NOT tune anything on DS2.
+
+## Realistic targets (DS2, AAMI)
+
+- Plain accuracy >= 95 % is realistic: N is about 90 % of DS2, so even
+  "predict all N" scores about 90 %. Always print that baseline.
+- What separates models is S (SVEB) sensitivity and PPV, V sensitivity, and
+  macro-F1. Published inter-patient S sensitivity is about 77-89 %.
+  Our target: accuracy >= 97 %, S sens >= 80 %, V sens >= 93 %, plus the
+  best macro-F1 we can get.
+- The teacher is chosen by DS1-validation macro-F1 (S and V weighted), never
+  by DS2.
+
+## Data
+
+- MIT-BIH Arrhythmia Database (PhysioNet `mitdb`), 360 Hz. Download with
+  `wfdb.dl_database` into `data/mitdb/` if it is missing. Reuse
+  `datasets/mitbih/mitdb/` or HasanML/paper3's data folder if it exists.
+- Lead MLII only, selected by name from `sig_name` (record 114 has its leads
+  swapped). ABLATION: add V1/V5 as a 2nd channel. This is not for the ESP32
+  student, but the teacher may see more than the student.
+- Beats: R-peak positions from the `atr` annotations. Drop non-beat
+  annotations. Paced records 102, 104, 107, 217 are excluded.
+
+### Split (de Chazal 2004)
+
+  DS1 (train): 101, 106, 108, 109, 112, 114, 115, 116, 118, 119, 122, 124,
+               201, 203, 205, 207, 208, 209, 215, 220, 223, 230
+  DS2 (test):  100, 103, 105, 111, 113, 117, 121, 123, 200, 202, 210, 212,
+               213, 214, 219, 221, 222, 228, 231, 232, 233, 234
+
+Validation must be PATIENT-WISE, because a random beat split inside DS1 leaks
+patients and makes early stopping too optimistic:
+  DEFAULT: DS1-train = DS1 records < 200; DS1-val = DS1 records >= 200
+           (same as Farag 2023, so the 1D-CNN and the KAN-Former are compared
+           on identical splits).
+  For the hyper-parameter search: 5-fold GroupKFold over DS1 records
+  (group = record), stratified so that every fold has S and V beats
+  (check this: some DS1 records have almost no S beats). Report the mean
+  over folds.
+DS2 is used ONLY for the final test, after the configuration is frozen.
+
+### Labels (ANSI/AAMI EC57)
+
+| AAMI | MIT-BIH symbols |
+|------|-----------------|
+| N    | N, L, R, e, j   |
+| S    | A, a, J, S      |
+| V    | V, E            |
+| F    | F               |
+| Q    | /, f, Q         |
+
+`--classes`: 5 = N,S,V,F,Q (DEFAULT, our main task); 4 = N,S,V,F (Q has
+about 15 beats in DS2 once the paced records are removed; most papers drop
+it); 3 = N,S,V (for comparison with Farag).
+Print beat counts per class for DS1-train, DS1-val and DS2.
+
+`--task binary` with `--binary-def`:
+  aami (DEFAULT): Normal = AAMI N; Arrhythmia = S, V, F (and Q).
+  raw: Normal = symbol 'N' only; everything else is Arrhythmia (matches our
+       earlier LightGBM binary task, train_binary.py).
+Report binary results two ways: (a) a dedicated binary model with a 2-unit
+head; (b) the 5-class model collapsed, P(arr) = 1 - P(N). Pick the threshold on
+DS1-val (maximise arrhythmia F1) and also report results at 0.5.
+
+## Preprocessing
+
+- Band-pass 0.5-40 Hz, 4th-order Butterworth, zero-phase (filtfilt). This
+  removes baseline wander and powerline noise and matches preprocess.py and
+  the KAN-Former paper. ABLATION: no filter.
+- Keep 360 Hz (the teacher runs in the cloud, so no resampling is needed).
+  ABLATION: resample to 128 Hz to match the student's input exactly. This
+  makes distillation simpler if the student cannot take the teacher's input.
+- Input = TWO aligned views, both centred on the current beat's R peak:
+  1. Beat window (morphology): 256 samples (about 0.71 s), 90 before the R
+     peak and 166 after. This covers P-QRS-T.
+  2. Context window (rhythm): 1080 samples (3 s), centred on the R peak, so
+     the neighbouring beats are visible. This is what lets an attention model
+     see an early P wave or a compensatory pause (S/V cues). ABLATION:
+     context 720 samples (2 s), and no context window.
+  Pad with the edge value at record boundaries and log how many beats were
+  padded. Keep every annotated beat.
+- Normalisation: z-score each window by its OWN mean and std (per beat, not
+  per record and not global). This removes the inter-patient amplitude
+  differences that hurt DS2 generalisation.
+- RR features (causal except post_RR; computed from ALL annotated beats,
+  including dropped classes, so an interval never jumps over a removed beat):
+    pre_RR, post_RR, local_mean = mean of the last 10 RR,
+    global_mean = mean of the last 400 RR (at a record's start, use whatever
+    history exists);
+    features = pre/local, post/local, pre/global, post/global,
+               pre/post, (post - pre)/local    -> 6 values
+  Use RATIOS only, never absolute RR (absolute RR is patient-specific and
+  hurts inter-patient results). Sanity check: LightGBM on the RR features
+  alone should reach roughly 90-93 % accuracy and S recall near 60 %. If it
+  doesn't, fix the RR features before training any network.
+
+## Model: KAN-Former-1D (PyTorch)
+
+Use PyTorch: it is cloud-only and KAN layers are easiest there. Implement the
+KAN layer yourself, following the "efficient-kan" formulation (B-spline basis
+plus a SiLU base branch), in src/kan.py, so there is no unpinned dependency.
+Give it a unit test.
+
+Architecture (DEFAULT; target 0.5-1.5M parameters, like the 1.16M of the
+original):
+
+  beat_in   (B, C, 256)      context_in (B, C, 1080)     rr_in (B, 6)
+
+  [Stem, shared design, separate weights for beat and context]
+    Conv1d(C, 32, k=7, stride=1) -> BN -> GELU
+  [Multi-scale block x 3]   (the paper's MS-CA, made 1D)
+    parallel depthwise-separable Conv1d branches with kernels 3, 7, 15
+    (1D equivalents of 3x3/5x5/7x7; 15 at 360 Hz is about 42 ms, the
+    QRS scale) -> concat -> pointwise Conv1d -> BN -> GELU
+    -> squeeze-and-excitation channel attention (reduction 8)
+    -> residual add -> MaxPool1d(2)
+    channel widths 32 -> 64 -> 128
+  The beat branch gives (B, 128, 32) tokens and the context branch gives
+  (B, 128, 135) tokens. Project both to d_model = 128.
+  [Token sequence]
+    [CLS] + beat tokens + context tokens + 1 RR token (Linear(6 -> 128)),
+    plus learnable positional embeddings and a learnable segment embedding
+    (beat / context / RR).
+  [Transformer encoder]
+    3 layers, d_model 128, 4 heads, FFN = GLU with hidden 256 (the paper's
+    TF-FFN), dropout 0.1, pre-norm, stochastic depth 0.1.
+    Attention: standard softmax attention (DEFAULT; about 170 tokens is
+    cheap). ABLATION: Nyström attention with 32 landmarks, as in the original.
+  [Head]
+    concat(CLS output, mean-pooled tokens, RR features) -> LayerNorm
+    -> KANLinear(128*2 + 6 -> 64, grid_size=5, spline_order=3)
+    -> dropout 0.2 -> KANLinear(64 -> n_classes, grid_size=5, spline_order=3)
+    The RR features are fed BOTH as a token and directly into the head: the
+    direct path gives the head a shortcut for S beats.
+    Inputs to the KAN head are kept inside the spline grid range by the
+    LayerNorm plus a tanh scaling. Set grid_range = [-1, 1] and say why in a
+    comment.
+
+Required ablations (same seeds and split; one table in the README):
+  A1 MLP head instead of KAN (same hidden width). This is the paper's
+     "without KAN" test. Report params for both: in the original paper the
+     KAN version had twice the parameters.
+  A2 no Transformer (CNN + KAN head only)
+  A3 no context window (beat + RR only)
+  A4 no RR features
+  A5 no multi-scale (single kernel 7)
+  A6 KAN grid_size 3 / 8
+  A7 STFT input, as in the original paper: a spectrogram of the 3 s context
+     window (Hann, 64-sample window, hop 8) through 2D convs. Expected to be
+     worse at beat level; test it anyway because it is the paper's design.
+
+## Training
+
+- Loss DEFAULT: focal loss (gamma = 2) with class weights alpha =
+  (1 / class_freq) ** 0.5, normalised, computed on DS1-train. Use the square
+  root because full inverse-frequency weights overshoot and destroy N/S PPV.
+  ABLATION: weighted CE; plain CE; label smoothing 0.05.
+- Sampler: class-balanced batches, capped at 30 % S and 30 % V per batch.
+  ABLATION: natural sampling. Do NOT use SMOTE on raw signals (synthetic
+  beats interpolated across patients leak shape; it is also not needed with
+  focal loss).
+- Augmentation (train only, applied on the fly, each with p = 0.5):
+  amplitude scale U(0.8, 1.2); additive Gaussian noise at SNR 20-35 dB;
+  baseline wander (sine 0.1-0.5 Hz, amplitude up to 0.1 of the window std);
+  time shift +/- 10 samples; time stretch 0.9-1.1. These simulate
+  inter-patient variability, which is what DS2 tests.
+  Also: RR jitter +/- 3 % on the ratio features.
+- Optimiser: AdamW, lr 3e-4, weight decay 0.05, batch size 256, cosine
+  schedule with 5 warm-up epochs, max 100 epochs, gradient clipping 1.0,
+  mixed precision on GPU.
+- Early stopping on DS1-val MACRO-F1 (not val_loss and not accuracy),
+  patience 15, restore best weights.
+- EMA of weights (decay 0.999). Use the EMA weights for validation and test.
+- Seeds: 5 runs per configuration (seeds 0-4); report mean +/- std. Also
+  report a 5-seed logit-averaged ensemble. The ensemble is the actual
+  teacher.
+- Optional (flag `--pretrain`, off by default): self-supervised pretraining
+  on unlabelled DS1 windows by masked-signal reconstruction (mask 30 % of the
+  patches), following Xia 2023's denoising-AE gain (+0.27 points). Do not
+  download Icentia11k unless asked; it is about 200 GB.
+- Hyper-parameter search (optional, `--search`): Optuna, 40 trials, with the
+  objective = mean 5-fold GroupKFold DS1 macro-F1. Search lr, d_model
+  {96, 128, 192}, layers {2, 3, 4}, context length {720, 1080}, focal gamma
+  {1, 2, 3}, KAN grid {3, 5, 8}. Freeze the best configuration, THEN run DS2
+  once.
+- Parallelism: on a GPU, run seeds sequentially but use DataLoader workers;
+  on CPU, use a process pool across configurations. Use
+  `--device {auto, cpu, cuda}`.
+
+## Post-hoc (DS1-val only)
+
+- Temperature scaling of the logits on DS1-val (needed for distillation;
+  report the ECE before and after).
+- 5-class decision rule: argmax by default. ABLATION: per-class logit offsets
+  tuned on DS1-val to maximise macro-F1, then applied unchanged to DS2.
+
+## Metrics (src/metrics.py), on DS2 and on DS1-val
+
+- plain accuracy (1 - e), mean one-vs-rest accuracy (1 - 2e/K), and the
+  "predict all N" baseline. State which one each table uses: some papers
+  report the one-vs-rest mean, which looks higher.
+- per class: sensitivity, PPV, specificity, F1, support; macro and weighted
+  averages; confusion matrix (PNG + CSV)
+- AAMI EC57 gross Se / +P / FPR for S and V
+- ROC-AUC and PR-AUC (one-vs-rest)
+- params, FLOPs (fvcore or thop), GPU and CPU latency per beat
+- results/results_summary.md: one table with our KAN-Former, its ablations,
+  the paper3 1D-CNN (if results exist), and the literature rows (Farag 2023,
+  Xia 2023, Mousavi 2019, Ait Bourkha 2024; marked "reported, not
+  reproduced"). Every number for our models must be computed by the code.
+
+## Distillation outputs (the reason this model exists)
+
+After the final configuration is frozen:
+- Save the teacher ensemble's logits and calibrated soft labels at T in
+  {1, 2, 4} for EVERY DS1 beat (train + val) as
+  results/teacher/soft_labels_T{t}.npy, with beat_index.csv (record, sample,
+  symbol, AAMI label), so that the Keras student in paper3 can load them
+  regardless of framework.
+- Save the same for DS2 (for analysis only; never train the student on them).
+- Export the teacher to ONNX and TorchScript.
+- Do NOT try to put the KAN-Former on the ESP32. The B-spline KAN layers are
+  not supported by TFLite Micro, and the model is the teacher only.
+
+## Code layout (match HasanML/paper1-3)
+
+  HasanML/paper4/
+    README.md, requirements.txt (numpy, scipy, wfdb, scikit-learn, pandas,
+      matplotlib, pyyaml, torch, lightgbm, optuna, fvcore, onnx; pin
+      versions),
+    configs/default.yaml (every DEFAULT and ABLATION switch above),
+    src/: data.py, preprocess.py, rr.py, augment.py, kan.py, model.py,
+      losses.py, train.py, calibrate.py, metrics.py, distill_export.py,
+      run_experiment.py (argparse: --task {multiclass, binary}
+      --classes {3,4,5} --binary-def {aami, raw} --head {kan, mlp}
+      --context {0,720,1080} --no-rr --no-transformer --stft
+      --seeds --device --search --pretrain)
+    tests/test_pipeline.py
+    results/
+Add "Index:4, directory name: paper4" with the KAN-Former citation (marked
+"adapted, not replicated") to HasanML/papers.txt.
+
+Write the src files so they also work as Colab notebooks: `# %%` cell
+markers, and a path fallback to Path.cwd() when __file__ is undefined.
+Comments should explain both what the code does and the concept behind it
+(what a KAN layer is and why B-splines; why attention over neighbouring beats
+helps S detection; why RR ratios rather than absolute RR; why patient-wise
+validation; why focal loss), and justify each parameter value. Follow
+GenericCodingGuidelines.txt.
+
+## Tests (tests/test_pipeline.py)
+
+- No DS2 record appears in DS1-train, DS1-val, any GroupKFold fold, the
+  class-weight or normalisation statistics, the temperature fit, or the
+  threshold/offset tuning.
+- No record appears in both DS1-train and DS1-val (patient-wise validation).
+- The AAMI mapping covers every beat symbol; the binary aami/raw definitions
+  are correct.
+- RR features are causal: changing a future RR leaves earlier features
+  unchanged (except post_RR of the immediately preceding beat).
+- The beat and context windows are centred on the R peak; edge padding works.
+- KANLinear: output shape, gradients flow, B-spline bases sum to 1 inside the
+  grid, and it fits y = sin(x) on a toy problem better than a Linear layer.
+- Focal loss with gamma = 0 equals weighted CE.
+- metrics: known confusion matrix -> correct 1 - e and 1 - 2e/K.
+- The soft-label file has exactly one row per DS1 beat, in beat_index.csv
+  order, and each row sums to 1.
+
+## Working rules
+
+- Fix all seeds. The full DEFAULT run must be reproducible from one command.
+- Never fit, tune, select or stop on DS2. DS2 is evaluated once per frozen
+  configuration.
+- Do not report a number you did not compute. If DS2 results fall short of
+  the targets, report them as they are and analyse the confusion matrix
+  (S<->N confusions per DS2 record, e.g. records 222 and 232), rather than
+  tuning on DS2.
+- Build incrementally: data + counts -> RR features + LightGBM sanity check
+  -> CNN-only (A2) baseline -> full KAN-Former DEFAULT -> ablations ->
+  binary -> calibration + soft labels -> optional search/pretraining.

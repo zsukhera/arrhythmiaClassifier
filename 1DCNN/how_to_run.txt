@@ -1,0 +1,224 @@
+================================================================================
+HOW TO RUN — Farag (2023) Tiny Matched-Filter 1D-CNN (HasanML/paper3)
+================================================================================
+
+Paper: M. M. Farag, "A Tiny Matched Filter-Based CNN for Inter-Patient ECG
+       Classification and Arrhythmia Detection at the Edge," Sensors 23(3):1365,
+       2023, doi: 10.3390/s23031365.
+
+Code:  HasanML/paper3/
+       All commands below must be run from the HasanML/paper3/ directory
+       (or use the bash script at 1DCNN/run_paper3.sh which handles paths).
+
+--------------------------------------------------------------------------------
+0.  PREREQUISITES
+--------------------------------------------------------------------------------
+
+Python 3.10+ and the venv at ../../.venv must exist (it already does).
+If running fresh, install dependencies:
+
+    pip install -r HasanML/paper3/requirements.txt
+
+Packages needed: tensorflow>=2.10, tensorflow-model-optimization, xgboost,
+numpy, scipy, wfdb, scikit-learn, pandas, matplotlib, pyyaml, threadpoolctl.
+
+The MIT-BIH dataset is already at datasets/mitbih/mitdb/ (all 48 records).
+The pipeline auto-copies relevant records into HasanML/paper3/data/mitdb/ on
+first run — no manual data prep needed.
+
+--------------------------------------------------------------------------------
+1.  RUN THE TESTS  (always do this first)
+--------------------------------------------------------------------------------
+
+    cd HasanML/paper3
+    python -m pytest tests/ -v
+
+Expected: 34 passed, 0 failed, ~10 seconds.
+
+--------------------------------------------------------------------------------
+2.  SANITY CHECK — RR features + template plots  (~2 min)
+--------------------------------------------------------------------------------
+
+This validates that the data pipeline is working before any training.
+
+    python -m src.run_experiment --rr-baseline
+
+What it does:
+  - Loads all 44 records (12 DS1-train + 10 DS1-val + 22 DS2)
+  - Computes 4 causal RR features for every beat
+  - Trains XGBoost on the RR features alone (3-class N/S/V)
+  - Saves results to results/rr_baseline_xgboost.csv
+
+Expected output:
+  RR-only XGBoost: acc ~93%  N ~97%  S ~60%  V ~58%
+  (These are the paper's sanity-check targets — if far off, the RR feature
+   computation has a bug.)
+
+To also plot the 13 matched-filter templates (like paper Figure 4):
+
+    python -m src.run_experiment --templates-only
+
+Templates are saved to results/figures/templates.png.
+
+--------------------------------------------------------------------------------
+3.  TRAIN THE BEST MODEL — P1 / Model 6  (~20–60 min on CPU, ~5 min on GPU)
+--------------------------------------------------------------------------------
+
+P1 is the paper's best configuration:
+  3-class (N/S/V), input=derivative, NK=32, MF-trainable init, no class weights.
+  Runs 10 seeds (0–9) and reports mean ± std.
+
+    python -m src.run_experiment --p1
+
+What it does:
+  - Computes 13 MF templates from DS1-train only
+  - Trains 10 models (seeds 0–9) on DS1-train, validated on DS1-val
+  - Evaluates all 10 models on DS2 (never touched during training)
+  - Saves per-seed results to results/cache/P1_seed{n}.pkl
+  - Saves model weights to results/cache/P1_seed{n}.keras
+  - Plots confusion matrix to results/figures/confusion_P1.png
+  - Saves beat counts to results/beat_counts.md
+
+Expected paper targets on DS2:
+  OvR accuracy:  98.18 %  (this is the paper's "average accuracy" = 1-2e/K)
+  Plain accuracy: ~97.27 %
+  Avg F1:         92.17 %
+  SVEB sensitivity (Se_S): 85.3 %
+  VEB sensitivity  (Se_V): 96.34 %
+
+NOTE: If you interrupt the run, re-running the same command resumes from the
+last completed seed automatically (cached .pkl files are reused).
+
+DEVICE: By default uses GPU if available, else CPU.
+  Force CPU: python -m src.run_experiment --p1 --device cpu
+  Force GPU: python -m src.run_experiment --p1 --device cuda
+
+--------------------------------------------------------------------------------
+4.  VIEW RESULTS — WITHOUT RE-TRAINING
+--------------------------------------------------------------------------------
+
+After P1 has finished (or even partially, e.g. 3/10 seeds done):
+
+    python -m src.evaluate
+
+Shows:
+  - Comparison table: all cached runs side by side
+  - Per-run metrics table: accuracy, OvR accuracy, macro F1, per-class Se/PPV/F1
+  - Paper targets for P1 shown for comparison
+
+More options:
+    python -m src.evaluate --run P1 --per-seed    # one row per seed
+    python -m src.evaluate --run P1 --confusion   # confusion matrix in terminal
+    python -m src.evaluate --csv results/all_metrics.csv  # dump to CSV
+    python -m src.evaluate --run P1 --repredict   # reload .keras weights → re-infer DS2
+
+--------------------------------------------------------------------------------
+5.  BINARY EXTENSION  (~20–60 min extra)
+--------------------------------------------------------------------------------
+
+(a) Binary AAMI: Normal = N (N,L,R,e,j); Arrhythmia = S,V,F,Q
+(b) Binary raw:  Normal = symbol 'N' only; Arrhythmia = everything else
+
+    python -m src.run_experiment --p1 --p2 --p3
+
+P2 = binary aami, P3 = binary raw. Each trains a dedicated 2-class model AND
+evaluates the collapsed 3-class model (P(arr) = 1-P(N)) with an optimal
+threshold selected on DS1-val.
+
+Binary metrics reported: Se, Sp, PPV, F1, ROC-AUC, PR-AUC, confusion matrix.
+
+--------------------------------------------------------------------------------
+6.  FULL TABLE 4 GRID  (~6–12 hours on CPU, ~1–2 hours on GPU)
+--------------------------------------------------------------------------------
+
+Reproduces all paper Table 4 configurations:
+  input {signal, derivative, both} × NK {64, 32} × init {default, mf_trainable,
+  mf_frozen} × class_weight {none, balanced}  =  36 configurations × 10 seeds.
+  Plus 4-class and 5-class with the P1 setup.
+
+    python -m src.run_experiment --grid
+
+Each configuration is cached, so interrupted runs resume from where they stopped.
+
+--------------------------------------------------------------------------------
+7.  TFLITE EXPORT FOR ESP32
+--------------------------------------------------------------------------------
+
+After P1 has been trained:
+
+    python -m src.run_experiment --p1 --export
+
+Generates in results/export/:
+  model_P1_model6_float32.tflite   (~6 KB)
+  model_P1_model6_float16.tflite   (~4 KB)
+  model_P1_model6_dynamic.tflite   (~3 KB)
+  model_P1_model6_int8_ptq.tflite  (~2 KB, full integer)
+  model_P1_model6_int8_qat.tflite  (~2 KB, QAT)
+  model_P1_model6_float32.h        (C array for TFLite Micro)
+  model_P1_model6_int8_ptq.h       (C array for ESP32 firmware)
+
+Each .tflite is also evaluated on DS2; the accuracy/F1 drop from float32 is
+printed (the paper saw >10% drop for int8-PTQ, fixed by QAT).
+
+--------------------------------------------------------------------------------
+8.  UNDERSTANDING THE ACCURACY NUMBERS
+--------------------------------------------------------------------------------
+
+The paper reports "average accuracy" = 98.18 %. This is the MEAN ONE-VS-REST
+(OvR) accuracy = 1 - 2e/K, NOT plain multiclass accuracy.
+
+For K=3 at 98.18 % OvR:
+  plain accuracy ≈ 97.27 %
+  "predict all N" baseline ≈ 89.5 % (N is ~89.5% of DS2)
+
+Both are always reported side-by-side. The majority-class baseline shows what
+"accuracy" actually means — the model only gains ~7.5 pp above a trivial predictor
+in plain accuracy, but the minority-class sensitivities (Se_S ~85%, Se_V ~96%)
+are the real measure of quality.
+
+--------------------------------------------------------------------------------
+9.  KEY OUTPUT FILES
+--------------------------------------------------------------------------------
+
+results/
+  beat_counts.md           — beat counts per class for each split
+  paper_table4.md          — paper Table 4 reference values
+  results_summary.md       — our numbers vs paper (auto-generated)
+  rr_baseline_xgboost.csv  — XGBoost sanity check
+  P1_metrics_per_seed.csv  — per-seed metrics for P1
+  figures/
+    templates.png          — 13 matched-filter templates (paper Figure 4 equiv.)
+    confusion_P1.png       — confusion matrix on DS2
+  cache/
+    P1_seed{n}.pkl         — per-seed metrics (fast reload)
+    P1_seed{n}.keras       — model weights (reload without retraining)
+  export/
+    model_P1_model6_*.tflite
+    model_P1_model6_*.h
+
+--------------------------------------------------------------------------------
+10. QUICK REFERENCE — ALL CLI FLAGS
+--------------------------------------------------------------------------------
+
+  --p1               Run P1 (Model 6, paper's best, 3-class, 10 seeds)
+  --p2               Run P2 binary aami extension
+  --p3               Run P3 binary raw extension
+  --grid             Run full Table 4 grid
+  --rr-baseline      XGBoost RR-only sanity check only, then exit
+  --templates-only   Compute and plot templates, then exit
+  --export           TFLite export (run after --p1)
+  --task             multiclass | binary
+  --classes          3 | 4 | 5
+  --binary-def       aami | raw
+  --input            signal | derivative | both
+  --nk               32 | 64
+  --init             mf_trainable | mf_frozen | default
+  --class-weight     none | balanced
+  --seeds            0 1 2 3 4 5 6 7 8 9  (override default)
+  --device           auto | cpu | cuda
+  --mixed-precision  float16 on GPU (RTX/Ampere/Ada: ~1.5-2x faster)
+  --no-deterministic skip enable_op_determinism (faster, tiny repro loss)
+  --filter           none | bandpass
+  --results-dir      override output directory
+
+================================================================================

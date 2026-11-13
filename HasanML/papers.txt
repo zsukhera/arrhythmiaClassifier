@@ -13,5 +13,20 @@ doi: 10.1109/NER.2019.8716891.
 Index:2 
 dire name: paper2
 [2] 5-class (logistic regression):
-Ö. Yakut and E. Doğru Bolat, “An efficient arrhythmic heartbeat classification method using ECG morphology based features,” 
+Ö. Yakut and E. Doğru Bolat, “An efficient arrhythmic heartbeat classification method using ECG morphology based features,”
 Euroasia J. Math., Eng., Nat. Med. Sci., vol. 7, no. 13, pp. 200–212, 2020, doi: 10.38065/euroasiaorg.403.
+
+Index:3
+directory name: paper3
+[3] 3-class / binary (tiny matched-filter 1D-CNN, TFLite/ESP32):
+M. M. Farag, “A Tiny Matched Filter-Based CNN for Inter-Patient ECG Classification and Arrhythmia Detection at the Edge,”
+Sensors, vol. 23, no. 3, art. 1365, 2023, doi: 10.3390/s23031365.
+
+Index:4
+directory name: paper4
+[4] 5-class AAMI (KAN-Former-1D teacher model; knowledge distillation into paper3 student):
+Adapted from: Z. Liu et al., “KAN: Kolmogorov–Arnold Networks,” arXiv:2404.19756, 2024.
+Wang et al., “KAN-Former-1D: Knowledge-Augmented Network for ECG,” 2026.
+Knowledge distillation reference: G. Hinton et al., “Distilling the Knowledge in a Neural Network,” arXiv:1503.02531, 2015.
+Note: This is an adaptation combining KAN layers (Liu 2024) with a multi-scale CNN + Transformer
+architecture for ECG classification. The teacher produces soft labels consumed by the paper3 student.
