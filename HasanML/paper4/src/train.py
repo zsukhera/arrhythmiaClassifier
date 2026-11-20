@@ -127,38 +127,75 @@ class BeatDataset(Dataset):
 
 
 def _worker_init(worker_id):
-    """Seed each DataLoader worker independently to avoid correlated augmentation."""
+    """
+    Seed each DataLoader worker independently to avoid correlated augmentation.
+    BUGFIX: the dataset's own numpy Generator (used by augment_windows) was
+    created once in the parent process, so every worker inherited an identical
+    copy and produced identical augmentation streams.  Re-seed it per worker
+    from torch.initial_seed() (which differs per worker and per epoch and is
+    derived from the DataLoader generator, so it is reproducible).
+    """
     seed = torch.initial_seed() % (2 ** 31)
-    np.random.seed(seed + worker_id)
+    np.random.seed(seed % (2 ** 31))
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, "_rng"):
+        info.dataset._rng = np.random.default_rng(seed)
+
+
+def sampler_target_proportions(y: np.ndarray, n_classes: int, cfg_tr: dict) -> np.ndarray:
+    """
+    Per-class target proportions of each training batch.
+
+    Inverse-frequency targets with per-class caps, solved by water-filling:
+    every minority class gets min(inverse-frequency share, cap) and the
+    leftover mass goes to the uncapped classes (in practice N).
+
+    BUGFIX (2026-11-18): the original code capped only S and V.  With the
+    5-class DS1-train counts (N 23932, S 149, V 1234, F 13, Q 2) pure inverse
+    frequency gave Q ~86 % and F ~13 % of every batch -- i.e. the network was
+    trained almost exclusively on 2 Q beats and 13 F beats.  F and Q now have
+    their own caps (f_cap, q_cap).
+    """
+    caps_cfg = {1: float(cfg_tr.get("s_cap", 0.30)), 2: float(cfg_tr.get("v_cap", 0.30)),
+                3: float(cfg_tr.get("f_cap", 0.05)), 4: float(cfg_tr.get("q_cap", 0.01))}
+    counts = np.array([(y == i).sum() for i in range(n_classes)], dtype=np.float64)
+    present = counts > 0
+    inv = np.where(present, 1.0 / np.maximum(counts, 1.0), 0.0)
+    cap = np.array([caps_cfg.get(i, 1.0) for i in range(n_classes)])
+    cap[~present] = 0.0
+    target = np.zeros(n_classes)
+    free = present.copy()
+    mass = 1.0
+    for _ in range(n_classes + 1):
+        if not free.any() or mass <= 0:
+            break
+        share = np.where(free, inv, 0.0)
+        share = share / share.sum() * mass
+        over = free & (share > cap)
+        if not over.any():
+            target[free] = share[free]
+            break
+        target[over] = cap[over]
+        mass -= cap[over].sum()
+        free &= ~over
+    return target / target.sum()
 
 
 def build_sampler(y: np.ndarray, n_classes: int, cfg_tr: dict) -> Optional[WeightedRandomSampler]:
     """
-    Build a WeightedRandomSampler that over-samples minority classes,
-    capping S and V at 30% of each batch (by weight proportions).
+    Build a WeightedRandomSampler that over-samples minority classes up to
+    the capped target proportions of sampler_target_proportions().
     """
     if cfg_tr.get("sampler", "balanced") == "natural":
         return None   # natural class distribution
 
-    s_cap = float(cfg_tr.get("s_cap", 0.30))
-    v_cap = float(cfg_tr.get("v_cap", 0.30))
-
     counts = np.array([(y == i).sum() for i in range(n_classes)], dtype=np.float64)
-    total  = counts.sum()
+    target = sampler_target_proportions(y, n_classes, cfg_tr)
+    log.info("sampler target proportions: %s",
+             {i: round(float(t), 4) for i, t in enumerate(target)})
 
-    # Inverse-frequency target proportions, capped
-    target = 1.0 / np.maximum(counts, 1.0)
-    target /= target.sum()
-
-    # Apply cap: AAMI S = class 1, V = class 2 (3/4/5-class all have N=0, S=1, V=2)
-    if n_classes >= 2:
-        target[1] = min(target[1], s_cap)
-    if n_classes >= 3:
-        target[2] = min(target[2], v_cap)
-    target /= target.sum()
-
-    # Weight per sample = target proportion / actual proportion
-    weights_per_class = target / (counts / total + 1e-10)
+    # Weight per sample = target proportion / class count
+    weights_per_class = target / np.maximum(counts, 1.0)
     sample_weights    = torch.tensor(weights_per_class[y], dtype=torch.float64)
 
     return WeightedRandomSampler(sample_weights, num_samples=len(y), replacement=True)
@@ -185,15 +222,19 @@ class EMA:
     """
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay  = decay
+        self.n_updates = 0
         self.shadow = {n: p.data.clone().float() for n, p in model.named_parameters()}
 
     def update(self, model: nn.Module) -> None:
+        # Warm-up: effective decay min(decay, (1+t)/(10+t)).  DS1-train gives
+        # only ~100 steps/epoch, so a fixed 0.999 kept the EMA ~80 % at the
+        # random init after 2 epochs (validation of a near-random model).
+        self.n_updates += 1
+        d = min(self.decay, (1.0 + self.n_updates) / (10.0 + self.n_updates))
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if p.requires_grad:
-                    self.shadow[n].mul_(self.decay).add_(
-                        p.data.float(), alpha=1.0 - self.decay
-                    )
+                    self.shadow[n].mul_(d).add_(p.data.float(), alpha=1.0 - d)
 
     def apply_to(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         """Temporarily apply EMA weights; returns original weights for restore()."""
@@ -246,12 +287,43 @@ def evaluate(model: nn.Module, loader: DataLoader,
 
 
 # %%
+def _select_f1(y: np.ndarray, pred: np.ndarray, classes=None) -> float:
+    """Macro-F1 over `classes` (default: all classes present in y)."""
+    if not classes:
+        return macro_f1_from_preds(y, pred)
+    f1s = []
+    for c in classes:
+        tp = int(((pred == c) & (y == c)).sum())
+        fp = int(((pred == c) & (y != c)).sum())
+        fn = int(((pred != c) & (y == c)).sum())
+        p_, r_ = tp / (tp + fp + 1e-10), tp / (tp + fn + 1e-10)
+        f1s.append(2 * p_ * r_ / (p_ + r_ + 1e-10))
+    return float(np.mean(f1s))
+
+
+def _val_summary(logits: np.ndarray, y: np.ndarray) -> dict:
+    """Per-epoch DS1-val diagnostics (macro-F1 + S/V recall/PPV)."""
+    pred = logits.argmax(1)
+    out = {"f1": macro_f1_from_preds(y, pred),
+           "f1_nsv": _select_f1(y, pred, [0, 1, 2])}
+    for c, name in ((1, "S"), (2, "V")):
+        tp = int(((pred == c) & (y == c)).sum())
+        out[f"se_{name}"]  = tp / max(1, int((y == c).sum()))
+        out[f"ppv_{name}"] = tp / max(1, int((pred == c).sum()))
+    return out
+
+
 def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
               n_classes: int, seed: int,
-              device: torch.device) -> Tuple[nn.Module, EMA, dict]:
+              device: torch.device,
+              ckpt_path: Optional[Path] = None) -> Tuple[nn.Module, EMA, dict]:
     """
-    Train for one seed.  Returns (model_with_ema_weights, ema, history).
+    Train for one seed.  Returns (model_with_best_weights, ema, history).
     DS2 data must NOT appear in ds_tr or ds_val.
+
+    If ckpt_path is given, the full training state (model, optimiser,
+    scheduler, scaler, EMA, best-so-far, history) is written there after
+    every epoch and training resumes from it if it already exists.
     """
     t_cfg  = cfg["training"]
     a_cfg  = cfg.get("augmentation", {})
@@ -263,6 +335,7 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
         ds_tr["rr_feats"],  ds_tr["y"],
         augment=bool(a_cfg.get("enabled", True)), cfg_aug=a_cfg,
     )
+    tr_dataset._rng = np.random.default_rng(seed)   # used only if num_workers == 0
     val_dataset = BeatDataset(
         ds_val["beat_segs"], ds_val.get("context_segs"),
         ds_val["rr_feats"],  ds_val["y"],
@@ -270,6 +343,9 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
     )
 
     sampler    = build_sampler(ds_tr["y"], n_classes, t_cfg)
+    gen        = torch.Generator().manual_seed(seed)
+    if sampler is not None:
+        sampler.generator = gen
     n_workers  = int(cfg["compute"].get("dataloader_workers", 4))
     batch_size = int(t_cfg["batch_size"])
 
@@ -278,15 +354,27 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
         sampler=sampler, shuffle=(sampler is None),
         num_workers=n_workers, pin_memory=(device.type == "cuda"),
         collate_fn=_collate_skip_none, worker_init_fn=_worker_init,
+        generator=gen, persistent_workers=(n_workers > 0),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size * 2, shuffle=False,
-        num_workers=n_workers, pin_memory=(device.type == "cuda"),
+        num_workers=0, pin_memory=(device.type == "cuda"),
         collate_fn=_collate_skip_none,
     )
 
     # --- Loss & optimiser ---
-    alpha  = compute_class_alpha(ds_tr["y"], n_classes, mode="sqrt")
+    # BUGFIX (2026-11-18): alpha used to be computed from the RAW DS1-train
+    # counts although the balanced sampler had already rebalanced the batches,
+    # i.e. the imbalance was corrected twice (N weight 0.029 vs F 1.26 / Q 3.2
+    # on top of F/Q oversampling) and the 2-epoch sanity run predicted F for
+    # ~every beat.  Compute the sqrt weights from the class distribution the
+    # loss actually sees (sampler targets when the balanced sampler is on).
+    if t_cfg.get("sampler", "balanced") != "natural":
+        eff = sampler_target_proportions(ds_tr["y"], n_classes, t_cfg)
+        y_eff = np.repeat(np.arange(n_classes), np.round(eff * 100000).astype(int))
+        alpha = compute_class_alpha(y_eff, n_classes, mode=t_cfg.get("alpha_mode", "sqrt"))
+    else:
+        alpha = compute_class_alpha(ds_tr["y"], n_classes, mode=t_cfg.get("alpha_mode", "sqrt"))
     loss_fn = build_loss(cfg, alpha).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -301,34 +389,60 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
     )
 
     use_amp   = bool(t_cfg.get("mixed_precision", True)) and (device.type == "cuda")
-    scaler    = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
     ema       = EMA(model, decay=float(t_cfg["ema_decay"]))
     patience  = int(t_cfg["early_stop_patience"])
     max_ep    = int(t_cfg["max_epochs"])
     clip_norm = float(t_cfg["grad_clip"])
+    min_delta = float(t_cfg.get("early_stop_min_delta", 1e-5))
 
     best_f1   = -1.0
     best_wts  = None
     best_ema_shadow = None
+    best_epoch = 0
     stale     = 0
-    history   = {"train_loss": [], "val_f1": []}
+    start_ep  = 0
+    history   = {"train_loss": [], "val_f1": [], "val_diag": []}
+    elapsed_prev = 0.0
+
+    if ckpt_path is not None and Path(ckpt_path).exists():
+        ck = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        scaler.load_state_dict(ck["scaler"])
+        ema.shadow = {k: v.to(device) for k, v in ck["ema_shadow"].items()}
+        ema.n_updates = ck.get("ema_n_updates", 0)
+        best_f1, best_epoch, stale = ck["best_f1"], ck["best_epoch"], ck["stale"]
+        best_wts, best_ema_shadow = ck["best_wts"], ck["best_ema_shadow"]
+        history, start_ep = ck["history"], ck["epoch"] + 1
+        elapsed_prev = ck.get("elapsed", 0.0)
+        # BUGFIX: map_location moved the RNG ByteTensors to CUDA -> must be CPU
+        torch.set_rng_state(ck["torch_rng"].cpu())
+        gen.set_state(ck["gen_state"].cpu())
+        log.info("seed %d: resumed from %s at epoch %d", seed, ckpt_path, start_ep + 1)
 
     t0 = time.perf_counter()
-    for epoch in range(max_ep):
+    epoch = start_ep - 1
+    done = (stale >= patience) if start_ep > 0 else False
+    for epoch in range(start_ep, max_ep):
+        if done:
+            break
+        te = time.perf_counter()
         # --- Training ---
         model.train()
         ep_loss = 0.0
         for beats, ctxs, rrs, ys in tr_loader:
-            beats = beats.to(device)
-            ctxs  = ctxs.to(device) if ctxs is not None else None
-            rrs   = rrs.to(device)
-            ys    = ys.to(device)
+            beats = beats.to(device, non_blocking=True)
+            ctxs  = ctxs.to(device, non_blocking=True) if ctxs is not None else None
+            rrs   = rrs.to(device, non_blocking=True)
+            ys    = ys.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type,
                                  dtype=torch.float16, enabled=use_amp):
                 logits = model(beats, ctxs, rrs)
-                loss   = loss_fn(logits, ys)
+            loss = loss_fn(logits.float(), ys)   # loss in fp32 for stability
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -344,26 +458,50 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
 
         # --- Validation with EMA weights ---
         old_wts = ema.apply_to(model)
-        _, _, val_f1 = evaluate(model, val_loader, device)
+        val_logits, val_y, val_f1 = evaluate(model, val_loader, device)
         ema.restore(model, old_wts)
+        diag = _val_summary(val_logits, val_y)
+        sel_classes = t_cfg.get("select_classes")      # e.g. [0,1,2] = N/S/V macro-F1
+        if sel_classes:
+            val_f1 = _select_f1(val_y, val_logits.argmax(1), list(sel_classes))
         history["val_f1"].append(val_f1)
+        history["val_diag"].append(diag)
 
-        log.info("epoch %3d/%d  loss=%.4f  val_macro_f1=%.3f",
-                 epoch + 1, max_ep, avg_loss, val_f1)
+        log.info("epoch %3d/%d  loss=%.4f  val_macro_f1=%.4f  val Se_S=%.3f PPV_S=%.3f "
+                 "Se_V=%.3f PPV_V=%.3f  (%.1fs)",
+                 epoch + 1, max_ep, avg_loss, val_f1, diag["se_S"], diag["ppv_S"],
+                 diag["se_V"], diag["ppv_V"], time.perf_counter() - te)
 
         # --- Early stopping on macro-F1 ---
-        if val_f1 > best_f1 + 1e-5:
+        if val_f1 > best_f1 + min_delta:
             best_f1  = val_f1
+            best_epoch = epoch + 1
             best_wts = copy.deepcopy(model.state_dict())
             best_ema_shadow = copy.deepcopy(ema.shadow)
             stale    = 0
         else:
             stale += 1
             if stale >= patience:
-                log.info("early stop at epoch %d (patience=%d)", epoch + 1, patience)
-                break
+                log.info("early stop at epoch %d (patience=%d, best epoch %d)",
+                         epoch + 1, patience, best_epoch)
+                done = True
 
-    elapsed = time.perf_counter() - t0
+        if ckpt_path is not None:
+            tmp = Path(str(ckpt_path) + ".tmp")
+            torch.save({
+                "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                "ema_shadow": ema.shadow, "ema_n_updates": ema.n_updates,
+                "best_f1": best_f1,
+                "best_epoch": best_epoch, "stale": stale,
+                "best_wts": best_wts, "best_ema_shadow": best_ema_shadow,
+                "history": history, "epoch": epoch,
+                "elapsed": elapsed_prev + time.perf_counter() - t0,
+                "torch_rng": torch.get_rng_state(), "gen_state": gen.get_state(),
+            }, str(tmp))
+            os.replace(tmp, ckpt_path)
+
+    elapsed = elapsed_prev + time.perf_counter() - t0
 
     # Restore best weights
     if best_wts is not None:
@@ -372,9 +510,10 @@ def train_one(model: nn.Module, cfg: dict, ds_tr: dict, ds_val: dict,
 
     history["elapsed"] = elapsed
     history["best_val_f1"] = best_f1
-    history["n_epochs"] = epoch + 1
-    log.info("seed %d done: %d epochs, %.1f s, best_val_f1=%.4f",
-             seed, epoch + 1, elapsed, best_f1)
+    history["best_epoch"] = best_epoch
+    history["n_epochs"] = len(history["train_loss"])
+    log.info("seed %d done: %d epochs, %.1f s, best_val_f1=%.4f (epoch %d)",
+             seed, history["n_epochs"], elapsed, best_f1, best_epoch)
     return model, ema, history
 
 
@@ -409,7 +548,9 @@ def train_multi_seed(cfg: dict, ds_tr: dict, ds_val: dict, ds_test: dict,
         model = build_model(cfg, n_classes=n_classes).to(device)
         log.info("seed %d: %s", seed, model_summary(model))
 
-        model, ema, history = train_one(model, cfg, ds_tr, ds_val, n_classes, seed, device)
+        ckpt_path = (Path(cache_dir) / f"{run_name}_seed{seed}_ckpt.pt") if cache_dir else None
+        model, ema, history = train_one(model, cfg, ds_tr, ds_val, n_classes, seed,
+                                        device, ckpt_path=ckpt_path)
 
         # --- Evaluate with EMA weights ---
         old = ema.apply_to(model)
@@ -426,6 +567,8 @@ def train_multi_seed(cfg: dict, ds_tr: dict, ds_val: dict, ds_test: dict,
             "elapsed":       history["elapsed"],
             "n_epochs":      history["n_epochs"],
             "best_val_f1":   history["best_val_f1"],
+            "best_epoch":    history.get("best_epoch"),
+            "val_diag_hist": history.get("val_diag"),
             "train_loss":    history["train_loss"],
             "val_f1_hist":   history["val_f1"],
             "metrics_val":   m_val,

@@ -161,12 +161,85 @@ PAPER_PARAMS = {
     "colsample_bytree": 0.75,
 }
 
+# ----------------------------------------------------------------------
+# Optional run options (CLI, see `--help`).  The defaults below reproduce
+# the original behaviour exactly: beat-level StratifiedKFold, SMOTE,
+# paper search space, n_jobs=-1 on CPU, outputs named lgbm_{split}.*
+# ----------------------------------------------------------------------
+RUN_OPTS = {
+    "cv": "stratified",       # "stratified" | "group" (StratifiedGroupKFold by record)
+    "sampler": "smote",       # "smote" | "none"
+    "class_weight": None,     # None | "balanced"
+    "space": "paper",         # "paper" | "extended" (adds regularisation params)
+    "features": None,         # None | list[int] column indices to keep
+    "n_jobs": None,           # None → original (-1 on CPU, 1 on GPU)
+    "tag": "",                # suffix for model/study names, e.g. "_groupcv"
+    "enqueue_paper": True,    # seed paper params as trial 0
+}
+
+
+_DEFAULT_RUN_OPTS = dict(RUN_OPTS)
+
+
+def _tag() -> str:
+    return RUN_OPTS["tag"]
+
+
+def _lgbm_n_jobs() -> int:
+    if RUN_OPTS["n_jobs"] is not None:
+        return RUN_OPTS["n_jobs"]
+    return 1 if DEVICE != "cpu" else -1
+
+
+def _cv_score(pipeline, X_train, y_train, groups, cv) -> float:
+    """
+    Score used by the Optuna objective.
+
+    cv='stratified' (default): mean of per-fold macro-F1 (original behaviour).
+    cv='group': macro-F1 of the pooled out-of-fold predictions under
+                StratifiedGroupKFold by record — per-fold macro-F1 is
+                unstable because most record-folds contain no L/R beats.
+    """
+    if RUN_OPTS["cv"] == "group":
+        from sklearn.metrics import f1_score
+        from sklearn.model_selection import cross_val_predict
+        oof = cross_val_predict(
+            pipeline, X_train, y_train, groups=groups, cv=cv, n_jobs=1,
+        )
+        return float(f1_score(y_train, oof, average="macro"))
+
+    scores = cross_val_score(
+        pipeline,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring="f1_macro",
+        n_jobs=1,
+    )
+    return float(scores.mean())
+
+
+def _suggest_extended(trial: optuna.Trial) -> dict:
+    """Wider space incl. regularisation (used with --space extended)."""
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 100, 2000, log=True),
+        "max_depth": trial.suggest_int("max_depth", 3, 12),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 8, 64, log=True),
+        "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
+        "min_child_samples": trial.suggest_int("min_child_samples", 10, 2000, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 100.0, log=True),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+    }
+
 # %%
 
 
 def make_objective(
     X_train: np.ndarray,
     y_train: np.ndarray,
+    groups: np.ndarray | None = None,
 ):
     """
     Create the Optuna objective.
@@ -177,13 +250,29 @@ def make_objective(
     This prevents information leakage from validation folds.
     """
 
-    cv = StratifiedKFold(
-        n_splits=N_CV_FOLDS,
-        shuffle=True,
-        random_state=SEED,
-    )
+    if RUN_OPTS["cv"] == "group":
+        if groups is None:
+            raise ValueError("--cv group needs record ids for the groups")
+        from sklearn.model_selection import StratifiedGroupKFold
+        cv = StratifiedGroupKFold(
+            n_splits=N_CV_FOLDS,
+            shuffle=True,
+            random_state=SEED,
+        )
+    else:
+        cv = StratifiedKFold(
+            n_splits=N_CV_FOLDS,
+            shuffle=True,
+            random_state=SEED,
+        )
 
     def objective(trial: optuna.Trial) -> float:
+
+        if RUN_OPTS["space"] == "extended":
+            return _cv_score(
+                _make_pipeline(_suggest_extended(trial)),
+                X_train, y_train, groups, cv,
+            )
 
         params = {
             "n_estimators": trial.suggest_int(
@@ -224,47 +313,48 @@ def make_objective(
             ),
         }
 
-        pipeline = Pipeline([
-            (
-                "smote",
-                SMOTE(
-                    random_state=SEED,
-                ),
-            ),
+        pipeline = _make_pipeline(params)
 
-            (
-                "clf",
-                LGBMClassifier(
-                    **params,
-
-                    # Required for subsample to actually take effect
-                    subsample_freq=1,
-
-                    device=DEVICE,
-                    random_state=SEED,
-
-                    # GPU handles its own parallelism.
-                    n_jobs=1 if DEVICE != "cpu" else -1,
-
-                    verbose=-1,
-                ),
-            ),
-        ])
-
-        # n_jobs=1 here avoids nested parallelism between
+        # n_jobs=1 inside _cv_score avoids nested parallelism between
         # CV and LightGBM threads.
-        scores = cross_val_score(
-            pipeline,
-            X_train,
-            y_train,
-            cv=cv,
-            scoring="f1_macro",
-            n_jobs=1,
-        )
-
-        return float(scores.mean())
+        return _cv_score(pipeline, X_train, y_train, groups, cv)
 
     return objective
+
+
+def _make_pipeline(params: dict) -> Pipeline:
+    """
+    SMOTE (unless --sampler none) + LightGBM.  With default RUN_OPTS this is
+    exactly the original pipeline.
+    """
+    steps = []
+    if RUN_OPTS["sampler"] == "smote":
+        steps.append((
+            "smote",
+            SMOTE(
+                random_state=SEED,
+            ),
+        ))
+    steps.append((
+        "clf",
+        LGBMClassifier(
+            **params,
+
+            # Required for subsample to actually take effect
+            subsample_freq=1,
+
+            class_weight=RUN_OPTS["class_weight"],
+
+            device=DEVICE,
+            random_state=SEED,
+
+            # GPU handles its own parallelism.
+            n_jobs=_lgbm_n_jobs(),
+
+            verbose=-1,
+        ),
+    ))
+    return Pipeline(steps)
 
 
 # %%
@@ -285,13 +375,13 @@ def get_or_create_study(
 
     db_path = (
         CHECKPOINT_DIR
-        / f"lgbm_{split_name}_optuna.db"
+        / f"lgbm_{split_name}{_tag()}_optuna.db"
     )
 
     # Absolute SQLite path.
     storage_url = f"sqlite:///{db_path.resolve()}"
 
-    study_name = f"lgbm_{split_name}"
+    study_name = f"lgbm_{split_name}{_tag()}"
 
     print(f"\n  Optuna checkpoint:")
     print(f"    {db_path}")
@@ -368,12 +458,12 @@ def train_and_save(
 
     pkl_path = (
         MODEL_DIR
-        / f"lgbm_{split_name}.pkl"
+        / f"lgbm_{split_name}{_tag()}.pkl"
     )
 
     meta_path = (
         MODEL_DIR
-        / f"lgbm_{split_name}_optuna.json"
+        / f"lgbm_{split_name}{_tag()}_optuna.json"
     )
 
     # ----------------------------------------------------------
@@ -405,6 +495,11 @@ def train_and_save(
 
     X_train = data["X_train"]
     y_train = data["y_train"]
+
+    # Optional: record ids for --cv group, column subset for --features
+    groups = data["record_ids_train"] if RUN_OPTS["cv"] == "group" else None
+    if RUN_OPTS["features"] is not None:
+        X_train = X_train[:, RUN_OPTS["features"]]
 
     print(
         f"  Train  : "
@@ -457,7 +552,7 @@ def train_and_save(
     # Seed paper parameters ONLY for a brand-new study
     # ----------------------------------------------------------
 
-    if existing_trials == 0:
+    if existing_trials == 0 and RUN_OPTS["enqueue_paper"]:
 
         print(
             "\n  New study detected."
@@ -524,6 +619,7 @@ def train_and_save(
                 make_objective(
                     X_train,
                     y_train,
+                    groups,
                 ),
 
                 n_trials=remaining_trials,
@@ -628,7 +724,7 @@ def train_and_save(
 
     search_meta_path = (
         CHECKPOINT_DIR
-        / f"lgbm_{split_name}_search_complete.json"
+        / f"lgbm_{split_name}{_tag()}_search_complete.json"
     )
 
     with open(
@@ -648,9 +744,14 @@ def train_and_save(
                 "n_cv_folds": N_CV_FOLDS,
                 "paper_params": PAPER_PARAMS,
                 "device": DEVICE,
+                **(
+                    {"run_opts": dict(RUN_OPTS)}
+                    if RUN_OPTS != _DEFAULT_RUN_OPTS
+                    else {}
+                ),
                 "optuna_db": str(
                     CHECKPOINT_DIR
-                    / f"lgbm_{split_name}_optuna.db"
+                    / f"lgbm_{split_name}{_tag()}_optuna.db"
                 ),
             },
             f,
@@ -671,12 +772,16 @@ def train_and_save(
         "with SMOTE ..."
     )
 
-    X_res, y_res = SMOTE(
-        random_state=SEED
-    ).fit_resample(
-        X_train,
-        y_train,
-    )
+    if RUN_OPTS["sampler"] == "smote":
+        X_res, y_res = SMOTE(
+            random_state=SEED
+        ).fit_resample(
+            X_train,
+            y_train,
+        )
+    else:
+        print("  (--sampler none: no SMOTE in final refit)")
+        X_res, y_res = X_train, y_train
 
     res_dist = {
         cls: int((y_res == cls).sum())
@@ -698,15 +803,13 @@ def train_and_save(
 
         subsample_freq=1,
 
+        class_weight=RUN_OPTS["class_weight"],
+
         device=DEVICE,
 
         random_state=SEED,
 
-        n_jobs=(
-            1
-            if DEVICE != "cpu"
-            else -1
-        ),
+        n_jobs=_lgbm_n_jobs(),
 
         verbose=-1,
     )
@@ -731,6 +834,12 @@ def train_and_save(
                 "best_params": best_params,
                 "cv_score": best_score,
                 "split": split_name,
+                # only present for non-default CLI runs
+                **(
+                    {"run_opts": dict(RUN_OPTS)}
+                    if RUN_OPTS != _DEFAULT_RUN_OPTS
+                    else {}
+                ),
             },
             f,
         )
@@ -755,6 +864,11 @@ def train_and_save(
                 "n_cv_folds": N_CV_FOLDS,
                 "paper_params": PAPER_PARAMS,
                 "device": DEVICE,
+                **(
+                    {"run_opts": dict(RUN_OPTS)}
+                    if RUN_OPTS != _DEFAULT_RUN_OPTS
+                    else {}
+                ),
             },
             f,
             indent=2,
@@ -770,17 +884,93 @@ def train_and_save(
 
     print(
         f"  ✓ Optuna DB   → "
-        f"{CHECKPOINT_DIR / f'lgbm_{split_name}_optuna.db'}"
+        f"{CHECKPOINT_DIR / f'lgbm_{split_name}{_tag()}_optuna.db'}"
     )
 
 
 # %%
 
 
+def _parse_args():
+    """
+    Optional CLI.  Running `python source/train.py` with no arguments is
+    identical to the original script (both splits, beat-level stratified
+    5-fold CV, SMOTE, paper search space, N_TRIALS=100).
+
+    Example — patient-grouped CV Optuna run on DS1 only:
+        LGBM_DEVICE=cpu python source/train.py --splits ds1ds2 \
+            --cv group --tag _groupcv --n-trials 100 --n-jobs 8
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--splits", nargs="+", default=["random", "ds1ds2"],
+                    choices=["random", "ds1ds2"])
+    ap.add_argument("--cv", default="stratified",
+                    choices=["stratified", "group"],
+                    help="group = StratifiedGroupKFold by record_id, "
+                         "objective = pooled out-of-fold macro-F1")
+    ap.add_argument("--sampler", default="smote", choices=["smote", "none"])
+    ap.add_argument("--class-weight", default=None, choices=["balanced"])
+    ap.add_argument("--space", default="paper", choices=["paper", "extended"])
+    ap.add_argument("--drop-features", nargs="+", default=None,
+                    help="feature names (from mit_bih_features.npz) to drop")
+    ap.add_argument("--n-trials", type=int, default=None)
+    ap.add_argument("--n-folds", type=int, default=None)
+    ap.add_argument("--n-jobs", type=int, default=None)
+    ap.add_argument("--tag", default="",
+                    help="suffix for model / study names (required for any "
+                         "non-default option so existing models are not touched)")
+    ap.add_argument("--no-enqueue-paper", action="store_true")
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
+
+    _args = _parse_args()
+
+    if _args.n_trials is not None:
+        N_TRIALS = _args.n_trials
+    if _args.n_folds is not None:
+        N_CV_FOLDS = _args.n_folds
+
+    RUN_OPTS.update(
+        cv=_args.cv,
+        sampler=_args.sampler,
+        class_weight=_args.class_weight,
+        space=_args.space,
+        n_jobs=_args.n_jobs,
+        tag=_args.tag,
+        enqueue_paper=not _args.no_enqueue_paper,
+    )
+    if _args.drop_features:
+        _names = [
+            str(n) for n in np.load(
+                PROC_DIR / "mit_bih_features.npz", allow_pickle=True,
+            )["feature_names"]
+        ]
+        _unknown = set(_args.drop_features) - set(_names)
+        if _unknown:
+            raise SystemExit(f"Unknown feature names: {sorted(_unknown)}")
+        RUN_OPTS["features"] = [
+            i for i, n in enumerate(_names)
+            if n not in set(_args.drop_features)
+        ]
+
+    _changed = {
+        k: v for k, v in RUN_OPTS.items()
+        if k not in ("tag", "n_jobs") and v != _DEFAULT_RUN_OPTS[k]
+    }
+    if _changed and not RUN_OPTS["tag"]:
+        raise SystemExit(
+            f"Non-default options {_changed} require --tag so the "
+            f"existing lgbm_<split>.pkl / Optuna DBs are not reused."
+        )
 
     print("\nMIT-BIH LightGBM Training")
     print("=" * 62)
+    if RUN_OPTS != _DEFAULT_RUN_OPTS:
+        print(f"Run options : {RUN_OPTS}")
 
     print(
         f"Device      : {DEVICE}"
@@ -798,10 +988,7 @@ if __name__ == "__main__":
         f"Checkpoints   : {CHECKPOINT_DIR}"
     )
 
-    for name in (
-        "random",
-        "ds1ds2",
-    ):
+    for name in _args.splits:
 
         train_and_save(
             name,

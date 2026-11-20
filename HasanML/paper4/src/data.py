@@ -237,3 +237,27 @@ def get_records_for_split(split: str) -> List[str]:
     if split == "ds1":       return DS1
     if split == "ds2":       return DS2
     raise ValueError(f"Unknown split: {split}")
+
+
+# %%
+# Alternative patient-wise DS1 validation split (fix for the S-starved
+# Farag split, 2026-11-18).  Chosen ONLY from DS1 per-record label counts
+# (DS2 never consulted): the Farag "<200" split leaves DS1-train with 149 S
+# beats (6 of 12 records have <= 4 S) while DS1-val holds 795.  This split
+# keeps 14 records / 614 S / 3070 V / 409 F for training and 8 records /
+# 330 S / 718 V for validation (val F = 6, so model selection uses the
+# N/S/V macro-F1, see training.select_classes).
+DS1_TRAIN_BAL = ["101", "106", "108", "109", "112", "114", "116", "119",
+                 "201", "205", "208", "209", "215", "223"]
+DS1_VAL_BAL   = ["115", "118", "122", "124", "203", "207", "220", "230"]
+assert sorted(DS1_TRAIN_BAL + DS1_VAL_BAL) == sorted(DS1)
+assert not set(DS1_TRAIN_BAL) & set(DS1_VAL_BAL)
+
+
+def ds1_split(name: str = "farag"):
+    """Return (train_records, val_records) for the named DS1 split."""
+    if name in (None, "farag", "default"):
+        return DS1_TRAIN, DS1_VAL
+    if name == "balanced":
+        return DS1_TRAIN_BAL, DS1_VAL_BAL
+    raise ValueError(f"unknown DS1 split {name!r}")

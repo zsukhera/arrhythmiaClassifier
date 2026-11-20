@@ -1,0 +1,281 @@
+HOW TO RESUME THE 9-AGENT RUN (started 2026-11-18 ~13:20)
+=====================================================================
+
+WHAT HAPPENED
+-------------
+On 2026-11-18 a Claude Code session launched 9 background agents. They
+work on the GPU box to finish every remaining ML item in progress.md,
+except knowledge distillation (deliberately skipped) and the
+hardware/system items (not started).
+
+The agents ran on the laptop and SSH'd into the box. When the laptop
+turns off, the agents die. However:
+  - jobs they started with nohup ON THE BOX keep running and save
+    their outputs;
+  - each agent was told to keep a resume note on the box:
+        $ROOT/reports/<agent>.RESUME.md
+    with: what's done, what's running (PID/log), the remaining steps
+    with exact commands, and bugs/decisions so far;
+  - finished agents write:  $ROOT/reports/<agent>.md
+
+
+QUICK RESTART (recommended)
+---------------------------
+1. Open Claude Code in /home/sirajmunir/fyp.
+2. Paste this prompt:
+
+   Read RESUME_AGENTS.txt. SSH into the GPU box and check
+   ~/Desktop/arrhythmiaClassifier/reports/ and the running processes.
+   For each of the 9 agents: if reports/<name>.md exists it's done;
+   otherwise relaunch it as a background agent, using the brief in
+   RESUME_AGENTS.txt plus the contents of reports/<name>.RESUME.md,
+   telling it to continue (not restart) from existing outputs/caches
+   and not to kill jobs that are still running. No knowledge
+   distillation. When all are done, sync the code/results to the
+   local repo and update progress.md.
+
+Make sure the laptop doesn't sleep while the agents run (plugged in,
+sleep = Never, lid close = Do nothing).
+
+
+GPU BOX
+-------
+  ssh:      sshpass -p 'ScamIblees' ssh i230510@100.124.204.76
+            (CLAUDE.md says username i230750, but i230510 is the one
+            that works)
+  $ROOT   = /home/i230510/Desktop/arrhythmiaClassifier
+  Hardware: 28 CPU cores, 30 GB RAM, RTX 4000 Ada 20 GB
+            (driver 595 / CUDA 13.2, working since the 11-16 reboot)
+  Envs:
+    $ROOT/.venv         Py 3.14, TF 2.22rc0 (CPU only), LightGBM 4.7,
+                        XGBoost, optuna, imblearn
+    $ROOT/.venv-torch   Py 3.14, torch 2.15.0+cu132 (CUDA works),
+                        wfdb, sklearn, onnx... (created 11-18)
+    $ROOT/.venv-export  may exist (farag-export agent, for TFLite/tfmot)
+  MIT-BIH data: $ROOT/datasets/mitbih/mitdb ; processed in
+                $ROOT/datasets/processed/
+
+Useful checks:
+  ls -la $ROOT/reports/
+  ps -eo etime,pcpu,args | grep python | grep -v grep
+  nvidia-smi
+
+
+RULES GIVEN TO EVERY AGENT (repeat them when relaunching)
+----------------------------------------------------------
+- Do all compute on the box; read the local repo for context
+  (progress.md first).
+- Only edit your OWNED PATHS (below). Never edit progress.md or
+  notes.txt. No git commit/push/checkout/reset/stash.
+- Long jobs: nohup on the box, logs in your own dir, wait with remote
+  `timeout 500 bash -c "while kill -0 PID; do sleep 30; done"` loops.
+  Keep checkpoints/caches so runs resume.
+- DS2 is TEST ONLY: never use it for training, tuning, thresholds,
+  early stopping, or seed/model selection.
+- No knowledge distillation.
+- Stick to the CPU thread budget. Report honestly, including
+  negative results.
+- Keep reports/<name>.RESUME.md updated. Final report goes in
+  reports/<name>.md; final reply = key numbers + files changed.
+- Never overwrite: models/lgbm_random.pkl, models/lgbm_ds1ds2.pkl
+  (and their Optuna DBs), HasanML/paper3/results/cache/P1_*,
+  results/P1_metrics_per_seed.csv.
+
+
+
+CONCURRENCY RULE (user, 11-19): run at most 2 agents at a time, because
+the usage limit runs out quickly otherwise.
+  - 11-19 15:05: resumed farag-fidelity + kanformer.
+  - 15:25: lgbm-groupcv resumed in the kanformer slot.
+  - 15:45: lgbm-groupcv done → lgbm-binary resumed. Queue empty.
+  - When resuming, SendMessage the existing agent if possible;
+    otherwise launch a new agent with its brief below + its
+    RESUME.md.
+  - Tell agents to poll rarely (long remote waits).
+
+THE 9 AGENTS
+------------
+VERIFIED Farag 2023 Model 6 targets (farag-gap, see
+reports/farag-gap.md):
+  - DS2, mean of 10 runs, NO class weights.
+  - ACC 98.18 is PLAIN accuracy.
+  - Se   N/S/V 99.10 / 81.60 / 95.00
+  - PREC N/S/V 99.00 / 82.68 / 95.63
+  - Macro PREC / Se / F1: 92.44 / 91.90 / 92.17.
+  - SVEB 85.30 / VEB 96.34 belong to Model 1 (class weights, NK=64).
+  - Se_V 89.7 / Se_N 97.8 are wrong.
+  - The paper's architecture differs from ours: 11 kernels, tanh,
+    'same' conv on 64 samples, RR Dense 32/16/8 per value.
+Our official P1 model (10-seed ensemble + tau_S=0.50):
+  plain acc 91.61, Se_N 91.44, Se_S 87.10, Se_V 96.52, macro F1 77.08.
+
+1. farag-gap        CPU 2 threads
+   Owns:  1DCNN/gap_analysis/
+          1DCNN/1DCNN experiments/utils.py (target line only)
+          HasanML/paper3/results/paper_table4.md
+   Tasks: progress.md section A1-A5.
+   - A1: verify the paper's Table 4 (doi 10.3390/s23031365); find
+     where "Se_V 89.7 / Se_N 97.8" came from; fix utils.py and
+     paper_table4.md.
+   - A2: full metric set (plain/OvR acc, macro+weighted Se/PPV/F1/Sp,
+     per class, CM) for the P1_fullDS1 ensemble, argmax and tau=0.5.
+     Save gap_analysis/ensemble_probs.npz.
+   - A3: which averaging the paper uses.
+   - A4: DS2 beat counts and F/Q handling vs the paper.
+   - A5: RR-only XGBoost baseline (--rr-baseline).
+
+2. farag-improve    CPU 7 threads
+   STATUS: ✅ DONE 11-19. Report: reports/farag-improve.md. Do not relaunch.
+   Owns:  1DCNN/improve_B/
+          (imports HasanML/paper3/src; does not edit it)
+   Tasks: section B1-B5.
+   - B1: full DS1, no class weights, 10 seeds.
+   - B2: class-weight power sweep p in {0,.25,.5,.75,1}.
+   - B3: per-class logit-offset calibration for macro-F1 / OvR acc,
+     plus trade-off plot.
+   - B4: GroupKFold-by-record validation inside DS1 for early
+     stopping and thresholds.
+   - B5: two operating points chosen on DS1 only (sensitivity-
+     constrained; best macro-F1). Recommend a config.
+
+3. farag-fidelity   CPU 6 threads
+   Owns:  1DCNN/fidelity_C/
+          HasanML/paper3/src/*.py except export.py
+            (additive, backward-compatible edits only; 34 tests
+            must pass)
+          HasanML/paper3/configs/, tests/, results/
+            (grid/ablation outputs only)
+   Tasks: section C1-C4.
+   - C1: ablate the high-impact ones of the 17 ASSUMPTIONs (≥3 seeds).
+   - C2: match the paper's training hyper-parameters.
+   - C3: --grid (Models 1-6) and --ablations; compare ordering with
+     Table 4.
+   - C4: per-patient RR-normalisation variant.
+   - Recommend a final P1 config file.
+
+4. farag-export     CPU 3 threads
+   STATUS: ✅ DONE 11-19. Report: reports/farag-export.md. Do not relaunch.
+   Owns:  1DCNN/export/
+          HasanML/paper3/src/export.py
+          results/cache/P2_*, P3_*
+   Tasks:
+   - P2/P3 binary models (paper recipe + full-DS1/balanced recipe).
+   - Pick ONE P1_fullDS1 seed using DS1 only, then TFLite export:
+     f32/f16/dynamic/INT8-PTQ/INT8-QAT/50%-pruned+INT8, plus C headers.
+   - DS2 metrics per variant (argmax and tau=0.5).
+   - Edge metrics: flash, arena/RAM, params, latency on the box.
+   - README for the firmware.
+
+5. kanformer 
+   STATUS: ✅ FULLY DONE 11-19 (reports/kanformer.md incl. A5/A6). Do not relaunch.
+         GPU (≤14 GB) + CPU 6 threads (was using ~15;
+                    told to cut back)
+   Owns:  HasanML/paper4/
+          1DCNN/run_paper4.sh
+   Uses:  .venv-torch
+   Tasks:
+   - Unit tests, then sanity run (time an epoch).
+   - Full training (≥3 seeds) + temperature scaling on DS1-val.
+   - DS2 metrics: 5-class AAMI vs paper_targets.md, and 3-class N/S/V
+     vs Farag and our 1D-CNN.
+   - Ablations A1-A6b (shorten if > ~8 h).
+   - Export soft labels T in {1,2,4} for DS1+DS2 to
+     paper4/results/teacher/*.npz. Keys: record_id, r_sample (360 Hz),
+     AAMI label, 5-class + 3-class probabilities; plus a README.
+   - ONNX + TorchScript export.
+   - NO student/distillation training.
+
+6. lgbm-groupcv     CPU 8 threads
+   STATUS: ✅ DONE 11-19. Report: reports/lgbm-groupcv.md. Do not relaunch. (LightGBM OpenCL GPU optional)
+   Owns:  source/train.py (additive flags only)
+          source/groupcv/
+          models/*groupcv*, models/checkpoints/*groupcv*
+   Tasks:
+   - Grouped (by record) CV on DS1, SMOTE inside the fold; grouped-CV
+     score of the current params.
+   - Optuna with the grouped objective (≤ ~6 h) →
+     models/lgbm_ds1ds2_groupcv.pkl; DS2 eval as in evaluate.py.
+   - Variants: class weights vs SMOTE, dropping patient-identity
+     features, more regularisation.
+   - Quantify why LBBB/RBBB fail (records, feature shift).
+
+7. lgbm-binary      CPU 6 threads
+   STATUS: ✅ DONE 11-19. Report: reports/lgbm-binary.md. Do not relaunch.
+   Owns:  source/binaryLightGBM/
+          source/ablation/
+          models/lgbm_binary_*, models/checkpoints/lgbm_binary_*
+            (old Nov-6 binary DB renamed to *.stale)
+   Tasks:
+   - A1-A4 ablation on the new features (random via
+     evaluate.run_ablation, plus DS1/DS2 via source/ablation/
+     ablation.py).
+   - Binary N-vs-anomaly LightGBM with grouped CV + threshold tuned
+     on DS1 out-of-fold predictions (≤ ~6 h).
+   - DS2 P/R/F1/AUC + recall by original class vs collapsed 5-class
+     (F1 0.409) and paper (0.928).
+
+8. lstm             GPU (≤4 GB) + CPU 4 threads
+   STATUS: ✅ DONE 11-19. Report: reports/lstm.md. Do not relaunch.
+   (old note) STATUS 11-18 13:45: the agent handed back early (partial). Its grid
+   keeps running on the box:
+     - LSTM/run_all.sh → ends with ALL_DONE in LSTM/run_all.log
+     - then LSTM/run_rr.sh → ends with RR_DONE in LSTM/run_rr.log
+   To finish, relaunch the agent and tell it to:
+     a. wait for both markers (restart with setsid nohup if dead;
+        the scripts skip finished runs);
+     b. run `cd $ROOT/LSTM && ../.venv-torch/bin/python report.py`;
+     c. write reports/lstm.md, comparing against the CORRECTED Farag
+        Model 6 targets (plain acc 98.18, Se N/S/V 99.1/81.6/95.0,
+        macro F1 92.17), not 85.3/96.34.
+   Early result (AAMI N/S/V, DS2, 5 seeds):
+     plain acc 89–93, Se_S only 6–8%, Se_V 83–95.
+   Plain LSTM misses S beats → the RR-feature variant was added
+   (run_rr.sh).
+   Owns:  LSTM/
+   Uses:  .venv-torch
+   Tasks:
+   - LSTM baseline on (N, 720, 2) windows around R, band-pass
+     0.5-40 Hz, paced records excluded.
+   - Class-weighted CE, early stopping on patient-held-out DS1 val,
+     ≥3 seeds.
+   - (a) 5-symbol N/L/R/V/A on the random and DS1/DS2 splits vs
+     LightGBM.
+   - (b) AAMI N/S/V on DS1/DS2 vs Farag and our 1D-CNN.
+   - Report params and training time.
+
+9. zeroshot         CPU 4 threads
+   STATUS: ✅ DONE 11-18. Report: reports/zeroshot.md.
+   Do not relaunch. The zips in datasets/external can be deleted
+   (~4.3 GB).
+   Owns:  zeroshot/
+          datasets/external/  (downloads = untrusted data; scripts
+                               kept separately)
+   Tasks:
+   - Download PTB-XL 1.0.3 + Chapman-Shaoxing (physionet
+     ecg-arrhythmia 1.0.0). Lead II, resample 500→360 / 128 Hz.
+   - R-peak detector validated on MIT-BIH.
+   - Run LightGBM (lgbm_ds1ds2.pkl) and the Farag P1 ensemble with
+     NO retraining.
+   - Record-level eval with an aggregation rule fixed on MIT-BIH DS1
+     10-s strips. Label maps (PTB-XL SCP / Chapman codes → N/L/R/V/S).
+   - Report per-condition Se/Sp/PPV/F1 plus an MIT-BIH DS2 10-s
+     strip reference.
+
+
+AFTER ALL AGENTS FINISH
+-----------------------
+1. Read every $ROOT/reports/<name>.md.
+2. Copy the new and changed code/results from the box to the local
+   repo (/home/sirajmunir/fyp). Same relative paths: 1DCNN/*,
+   HasanML/paper3/src + results (not .keras/.pkl caches unless
+   wanted), HasanML/paper4, LSTM/, zeroshot/ (scripts only, NOT
+   datasets/external), source/train.py, source/groupcv,
+   source/ablation, source/binaryLightGBM, reports/.
+   Check `git diff` before committing anything.
+3. Update progress.md:
+   - fill the results into the existing sections;
+   - tick the todos in "Farag 2023 — gap to paper Table 4" and
+     "Left to do";
+   - fix the Se_V/Se_N targets once farag-gap has confirmed them.
+4. Still open afterwards: knowledge distillation (paused on purpose),
+   and the hardware/system items.

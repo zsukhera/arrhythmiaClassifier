@@ -79,6 +79,8 @@ training:
   sampler: balanced                           # balanced (capped at 30% S/V) | natural
   s_cap: 0.30                                 # max fraction of S beats per batch
   v_cap: 0.30                                 # max fraction of V beats per batch
+  f_cap: 0.05                                 # max fraction of F beats (only 13 in DS1-train)
+  q_cap: 0.01                                 # max fraction of Q beats (only 2 in DS1-train)
   batch_size: 256
   optimizer: adamw
   lr: 3.0e-4

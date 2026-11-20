@@ -114,6 +114,8 @@ def multiclass_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         proba = np.asarray(proba)
         present = np.unique(y_true)
         Y = label_binarize(y_true, classes=np.arange(k))
+        if k == 2 and Y.shape[1] == 1:   # sklearn returns one column for 2 classes
+            Y = np.column_stack([1 - Y[:, 0], Y[:, 0]])
         try:
             if len(present) > 1:
                 out["auc_macro"] = float(

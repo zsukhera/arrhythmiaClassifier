@@ -45,7 +45,8 @@ except NameError:
 try:
     from .data import (DS1_TRAIN, DS1_VAL, DS2, DS1,
                        load_record, aami_labels, task_labels,
-                       print_beat_counts, BEAT_SYMBOLS, AAMI_CLASSES)
+                       print_beat_counts, BEAT_SYMBOLS, AAMI_CLASSES,
+                       ds1_split)
     from .preprocess import preprocess_record
     from .rr import compute_rr_features, lightgbm_sanity_check
     from .model import build_model, model_summary, count_parameters
@@ -60,7 +61,8 @@ except ImportError:
     sys.path.insert(0, str(PROJECT_ROOT))
     from src.data import (DS1_TRAIN, DS1_VAL, DS2, DS1,
                           load_record, aami_labels, task_labels,
-                          print_beat_counts, BEAT_SYMBOLS, AAMI_CLASSES)
+                          print_beat_counts, BEAT_SYMBOLS, AAMI_CLASSES,
+                       ds1_split)
     from src.preprocess import preprocess_record
     from src.rr import compute_rr_features, lightgbm_sanity_check
     from src.model import build_model, model_summary, count_parameters
@@ -238,6 +240,13 @@ def main(argv=None) -> None:
                     help="Optuna hyper-parameter search")
     ap.add_argument("--pretrain",      action="store_true",
                     help="Self-supervised masked-signal pretraining before fine-tuning")
+    ap.add_argument("--max-epochs",    type=int, default=None)
+    ap.add_argument("--ablation-seeds", nargs="+", type=int, default=None,
+                    help="Seeds for each ablation (default: first seed only)")
+    ap.add_argument("--ablation-names", nargs="+", default=None,
+                    help="Subset of ablations to run, e.g. A1_mlp_head A4_no_rr")
+    ap.add_argument("--set",           nargs="*", default=[], metavar="KEY.SUB=VAL",
+                    help="Generic YAML override, e.g. --set training.lr=1e-4 model.n_layers=2")
     args = ap.parse_args(argv)
 
     cfg = load_config(_resolve(args.config))
@@ -254,7 +263,21 @@ def main(argv=None) -> None:
     if args.device:           cfg["compute"]["device"]              = args.device
     if args.mixed_precision:  cfg["compute"]["mixed_precision"]     = True
     if args.no_deterministic: cfg["compute"]["deterministic"]       = False
-    if args.results_dir:      cfg["output"]["results_dir"]          = args.results_dir
+    if args.results_dir:
+        # Keep cache/figures/teacher inside the run directory so separate runs
+        # never read each other's cached seeds.
+        cfg["output"]["results_dir"] = args.results_dir
+        cfg["output"]["cache_dir"]   = str(Path(args.results_dir) / "cache")
+        cfg["output"]["figures_dir"] = str(Path(args.results_dir) / "figures")
+        cfg["output"]["teacher_dir"] = str(Path(args.results_dir) / "teacher")
+    if args.max_epochs:       cfg["training"]["max_epochs"]         = args.max_epochs
+    for kv in args.set:
+        key, val = kv.split("=", 1)
+        node = cfg
+        parts = key.split(".")
+        for p_ in parts[:-1]:
+            node = node.setdefault(p_, {})
+        node[parts[-1]] = yaml.safe_load(val)
 
     out     = _resolve(cfg["output"]["results_dir"])
     fig_dir = _resolve(cfg["output"]["figures_dir"])
@@ -297,8 +320,11 @@ def main(argv=None) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("=== Loading data: task=%s, classes=%d ===", task, classes)
-    ds_tr   = build_dataset(DS1_TRAIN, cfg, task, classes, binary_def)
-    ds_val  = build_dataset(DS1_VAL,   cfg, task, classes, binary_def)
+    tr_recs, val_recs = ds1_split(cfg["data"].get("ds1_split", "farag"))
+    log.info("DS1 split '%s': train=%s val=%s", cfg["data"].get("ds1_split", "farag"),
+             tr_recs, val_recs)
+    ds_tr   = build_dataset(tr_recs,  cfg, task, classes, binary_def)
+    ds_val  = build_dataset(val_recs, cfg, task, classes, binary_def)
     ds_test = build_dataset(DS2,       cfg, task, classes, binary_def)
     write_counts(ds_tr, ds_val, ds_test, task, classes, out)
 
@@ -350,10 +376,13 @@ def main(argv=None) -> None:
             ("A6b_grid8",       {"model": {"kan_grid_size": 8}}),
         ]
         abl_results = {}
+        abl_seeds = args.ablation_seeds or [seeds[0]]
         for abl_name, override in ablation_specs:
+            if args.ablation_names and abl_name not in args.ablation_names:
+                continue
             r = run_ablation(abl_name, override, cfg,
                              ds_tr, ds_val, ds_test,
-                             classes, [seeds[0]], cache_dir, device)
+                             classes, abl_seeds, cache_dir, device)
             abl_results[abl_name] = r
 
         # Print ablation comparison
@@ -394,7 +423,7 @@ def main(argv=None) -> None:
                 continue
 
             model = build_model(cfg, n_classes=classes).to(device)
-            checkpoint = torch.load(str(pt_path), map_location=device)
+            checkpoint = torch.load(str(pt_path), map_location=device, weights_only=False)
             model.load_state_dict(checkpoint["state_dict"])
 
             ema = EMA(model, decay=float(cfg["training"]["ema_decay"]))
@@ -449,8 +478,13 @@ def main(argv=None) -> None:
         model = build_model(cfg, n_classes=classes).to(device)
         pt_path = cache_dir / f"DEFAULT_seed{seeds[-1]}.pt"
         if pt_path.exists():
-            ckpt = torch.load(str(pt_path), map_location=device)
+            ckpt = torch.load(str(pt_path), map_location=device, weights_only=False)
             model.load_state_dict(ckpt["state_dict"])
+            # BUGFIX: export the EMA weights (the ones that were evaluated),
+            # not the raw training weights.
+            for n, p in model.named_parameters():
+                if n in ckpt["ema_shadow"]:
+                    p.data.copy_(ckpt["ema_shadow"][n].to(p.dtype))
 
         if cfg.get("export", {}).get("onnx", True):
             export_onnx(model, cfg, teacher_dir / "kanformer.onnx", device)

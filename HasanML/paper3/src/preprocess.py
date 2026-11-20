@@ -41,6 +41,31 @@ def bandpass_filter(signal: np.ndarray, fs: float, low: float = 0.5, high: float
     return sosfiltfilt(sos, signal)
 
 
+def resample_signal_method(signal: np.ndarray, method: str = "poly",
+                           fs_in: float = 360.0, fs_out: float = 128.0) -> np.ndarray:
+    """
+    Resample with a selectable method (fidelity ablation; paper only says
+    "downsampled to 128 samples/s").
+      poly   : resample_poly(16, 45) — default, same as resample_signal()
+      fft    : scipy.signal.resample (DFT-based, what many Python ECG repos use)
+      linear : np.interp at the new sample instants (no anti-alias filter)
+      decimate_naive : nearest-sample pick (no anti-alias filter)
+    """
+    if method == "poly":
+        return resample_signal(signal)
+    n_out = int(np.ceil(len(signal) * fs_out / fs_in))
+    if method == "fft":
+        from scipy.signal import resample as _fft_resample
+        return _fft_resample(signal, n_out).astype(np.float64)
+    t_out = np.arange(n_out) * (fs_in / fs_out)
+    if method == "linear":
+        return np.interp(t_out, np.arange(len(signal)), signal).astype(np.float64)
+    if method == "decimate_naive":
+        idx = np.clip(np.round(t_out).astype(np.int64), 0, len(signal) - 1)
+        return signal[idx].astype(np.float64)
+    raise ValueError(f"Unknown resample method: {method!r}")
+
+
 def resample_signal(signal: np.ndarray, up: int = _UP, down: int = _DOWN) -> np.ndarray:
     """
     Resample from 360 Hz to 128 Hz using polyphase filtering.
@@ -100,6 +125,10 @@ def normalise_segment(segment: np.ndarray, method: str = "mean") -> np.ndarray:
         return (segment - segment.mean()) / (s if s > 1e-9 else 1.0)
     if method == "none":
         return segment.copy()
+    if method == "minmax":
+        lo, hi = segment.min(), segment.max()
+        rng = hi - lo
+        return (segment - lo) / (rng if rng > 1e-9 else 1.0)
     raise ValueError(f"Unknown normalisation method: {method!r}")
 
 
@@ -168,7 +197,17 @@ def preprocess_record(raw_signal: np.ndarray, r_samples_360: np.ndarray,
                                      int(p_cfg["bandpass_order"]))
 
     # Step 2 — resample 360 -> 128 Hz
-    signal_128 = resample_signal(raw_signal)
+    rs_method = str(p_cfg.get("resample", "poly"))   # poly | fft | linear | decimate_naive
+    if rs_method == "poly":
+        signal_128 = resample_signal(raw_signal)
+    else:
+        signal_128 = resample_signal_method(raw_signal, rs_method)
+
+    # input.crop_input (default true): centre-crop the window to NK samples.
+    # false = paper Table 3 (ECG input stays 64 samples; only the MF kernel
+    # is NK long).
+    if not bool(i_cfg.get("crop_input", True)):
+        nk = full
 
     # Step 3 — map R-peak indices to the new sample rate
     r_samples = map_r_peaks(r_samples_360)

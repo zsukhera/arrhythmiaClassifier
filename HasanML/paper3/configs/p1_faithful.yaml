@@ -1,0 +1,123 @@
+# Recommended final P1 (farag-fidelity, 2026-11-19): paper-faithful Farag 2023 Model 6.
+#  - Table 3 architecture: 64-sample input, Conv1D(11 filters, NK=32, same) -> BN -> tanh -> GMP;
+#    RR (4,1) -> Dense 32/16/8 ReLU per RR value -> Flatten(32); softmax(3). 1,267 params.
+#  - 11 MF templates (F, Q sub-classes dropped for 3 classes) from ALL DS1 (paper Sec 4.2/5.2).
+#  - Training on ALL DS1 (paper Sec 6.1 more than 50 K examples); DS1-val (>=200) is still the
+#    early-stopping set, which therefore overlaps training (as in the paper); max 100 epochs
+#    (paper: does not exceed 100 epochs). No class weights (Model 6).
+#  - Per-segment z-score normalisation [assumption; paper only says normalization].
+# DS2 (3 seeds, mean): acc 97.67, macro F1 90.26, macro PREC 89.33, Se N/S/V 98.6/80.2/95.4.
+# Paper Model 6: 98.18 / 92.17 / 92.44 / 99.1/81.6/95.0.  See reports/farag-fidelity.md.
+# Run: python -m src.run_experiment --p1 --config configs/p1_faithful.yaml #        --results-dir results/p1_faithful --cache-dir results/p1_faithful/cache
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+data:
+  data_dir: data/mitdb
+  local_mirrors:
+  - ../../datasets/mitbih/mitdb
+  lead: MLII
+  fs_original: 360
+  fs_target: 128
+  exclude_records:
+  - '102'
+  - '104'
+  - '107'
+  - '217'
+  train_records: ds1_all
+preprocess:
+  segment_samples: 64
+  before_r: 32
+  after_r: 32
+  filter: none
+  bandpass_low_hz: 0.5
+  bandpass_high_hz: 40.0
+  bandpass_order: 4
+  normalization: z-score
+input:
+  mode: derivative
+  nk: 32
+  crop_input: false
+rr:
+  local_window: 80
+  global_window: 400
+  use_post_rr: true
+  n_features: 4
+templates:
+  source: ds1_all
+  n_templates: 13
+  sub_classes:
+  - N
+  - L
+  - R
+  - e
+  - j
+  - A
+  - a
+  - J
+  - S
+  - V
+  - E
+  - F
+  - Q
+  min_beats: 5
+  normalize_l2: true
+  match_classes: true
+  recompute_per_variant: true
+model:
+  padding: same
+  activation: relu
+  rr_dense_units:
+  - 16
+  - 16
+  - 16
+  use_bias: true
+  arch: table3
+training:
+  loss: categorical_crossentropy
+  optimizer: adam
+  lr: 0.001
+  lr_reduce_factor: 0.5
+  lr_reduce_patience: 5
+  lr_min: 1.0e-05
+  batch_size: 512
+  max_epochs: 100
+  early_stop_patience: 20
+  restore_best_weights: true
+  class_weight: none
+task:
+  name: multiclass
+  classes: 3
+  init: mf_trainable
+  binary_def: aami
+binary:
+  threshold_strategy: val_f1
+  threshold_start: 0.01
+  threshold_stop: 0.99
+  threshold_step: 0.01
+export:
+  representative_beats: 500
+  pruning_sparsity: 0.5
+  pruning_begin_step: 0
+  pruning_end_step: 300
+  pruning_frequency: 100
+compute:
+  device: auto
+  mixed_precision: false
+  deterministic: true
+  cpu_workers: auto
+  tf_intra_threads: 0
+  tf_inter_threads: 0
+output:
+  results_dir: results
+  cache_dir: results/cache
+  figures_dir: results/figures
+  plot_templates: true

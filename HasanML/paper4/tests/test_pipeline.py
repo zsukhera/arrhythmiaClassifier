@@ -155,8 +155,11 @@ def test_rr_features_shape():
 
 def test_rr_features_no_future_leakage():
     """
-    Features for beat i must depend only on r_samples[0..i].
-    Appending an anomalous beat at the end must not change earlier features.
+    Features for beat i may depend only on r_samples[0..i+1]: the post-RR
+    features (cols 1,3,4,5) deliberately use ONE beat of look-ahead (the
+    next R-peak), as documented in rr.py; everything else is causal.
+    Appending an anomalous beat must therefore not change features of
+    beats 0..n-2, nor the pre-RR-only columns (0, 2) of beat n-1.
     """
     r6 = np.array([360, 720, 1080, 1440, 1800, 2160], dtype=np.int64)
     # anomalous 7th beat very far away
@@ -166,8 +169,10 @@ def test_rr_features_no_future_leakage():
     f7 = compute_rr_features(r7, fs=360.0, local_window=5, global_window=50)
 
     # Features for the first 6 beats must be identical
-    np.testing.assert_allclose(f6, f7[:6], rtol=1e-5,
+    np.testing.assert_allclose(f6[:5], f7[:5], rtol=1e-5,
                                 err_msg="Appending a future beat changed earlier RR features")
+    np.testing.assert_allclose(f6[5, [0, 2]], f7[5, [0, 2]], rtol=1e-5,
+                                err_msg="pre-RR features of the last beat used look-ahead")
 
 
 def test_rr_features_first_beat_finite():
@@ -524,3 +529,66 @@ def test_mlp_head_alternative():
 
     assert logits.shape == (2, 5)
     assert torch.all(torch.isfinite(logits))
+
+
+# ============================================================
+# 10. Balanced sampler (regression test for the Q/F domination bug)
+# ============================================================
+
+def test_sampler_caps_rare_classes():
+    """With DS1-train-like counts no class may exceed its cap; N gets the rest."""
+    from src.train import sampler_target_proportions
+    y = np.repeat(np.arange(5), [23932, 149, 1234, 13, 2])
+    cfg = {"s_cap": 0.30, "v_cap": 0.30, "f_cap": 0.05, "q_cap": 0.01}
+    t = sampler_target_proportions(y, 5, cfg)
+    np.testing.assert_allclose(t.sum(), 1.0, atol=1e-9)
+    assert t[4] <= 0.01 + 1e-9 and t[3] <= 0.05 + 1e-9
+    assert t[1] <= 0.30 + 1e-9 and t[2] <= 0.30 + 1e-9
+    assert t[0] >= 0.30, f"N share too small: {t}"
+
+
+def test_kan_former_no_rr():
+    """Ablation A4: n_features=0 ignores the RR input entirely."""
+    from src.model import KANFormer
+    cfg = {"preprocess": {"beat_len": 256, "context_len": 0},
+           "model": {"d_model": 32, "n_heads": 2, "n_layers": 1},
+           "rr": {"n_features": 0}}
+    model = KANFormer(cfg, n_classes=5).eval()
+    with torch.no_grad():
+        out = model(torch.randn(2, 1, 256), None, torch.randn(2, 6))
+    assert out.shape == (2, 5)
+
+
+# ============================================================
+# 11. kanformer2 additions: RR branch and extended RR features
+# ============================================================
+
+def test_kan_former_rr_branch():
+    """model.rr_branch + rr_aux_logits builds, runs, and RR changes the output."""
+    from src.model import KANFormer
+    cfg = {"preprocess": {"beat_len": 256, "context_len": 0},
+           "model": {"d_model": 32, "n_heads": 2, "n_layers": 1, "head": "mlp",
+                     "rr_branch": True, "rr_aux_logits": True},
+           "rr": {"n_features": 11}}
+    model = KANFormer(cfg, n_classes=5).eval()
+    beat = torch.randn(3, 1, 256)
+    with torch.no_grad():
+        a = model(beat, None, torch.ones(3, 11))
+        b = model(beat, None, 2 * torch.ones(3, 11))
+    assert a.shape == (3, 5) and not torch.allclose(a, b)
+
+
+def test_rr_features_ext_causal_and_base_unchanged():
+    """The 6 base columns equal compute_rr_features; the 5 extra columns of
+    beat i use no R peak beyond i+1 (same one-beat look-ahead as post-RR)."""
+    from src.rr import compute_rr_features_ext
+    rng = np.random.default_rng(0)
+    r = np.cumsum(rng.integers(250, 400, size=600))
+    ext = compute_rr_features_ext(r, 360.0)
+    assert ext.shape == (600, 11)
+    np.testing.assert_allclose(ext[:, :6], compute_rr_features(r, 360.0))
+    i = 450
+    r2 = r.copy()
+    r2[i + 2:] += 500          # change the future after beat i+1
+    ext2 = compute_rr_features_ext(r2, 360.0)
+    np.testing.assert_allclose(ext[i, 6:], ext2[i, 6:], rtol=1e-6)

@@ -5,30 +5,29 @@
 # **Arrhythmia Classification — CLARITY-AI 2.0 Re-implementation**
 # Zain Ul Arifeen Sukhera · 2026–27
 #
-# Evaluates the dedicated binary models trained by train_binary.py and
-# compares them against:
-#   (a) The paper's reported binary numbers (clarityBase.txt §8.1)
-#   (b) The 5-class model collapsed to binary (from train.py)
+# Evaluates the dedicated binary models trained by train_binary.py against
+#   (a) the paper's reported binary numbers (clarityBase.txt §8.1)
+#   (b) the 5-class model (models/lgbm_{split}.pkl) collapsed to binary
 #
-# Reports
-# -------
-#   1. Main binary metrics at default threshold (0.5)
-#      Accuracy, Precision, Recall, F1 (anomaly), AUC-ROC
-#   2. Optimal-threshold metrics (threshold that maximises anomaly-class F1
-#      on the test set — informational, not tuned during training)
-#   3. Class-origin breakdown: which 5-class label contributes how many
-#      binary errors (helps diagnose which arrhythmia type still fails)
-#   4. Confusion matrices saved to results/binary/
-#   5. Side-by-side comparison: paper / 5-class-collapsed / binary-model
+# Revision 2026-11-18 (lgbm-binary agent):
+#   * --tags to evaluate any lgbm_binary_{tag}.pkl (e.g. ds1ds2_stratifiedcv)
+#   * Reports three operating points for the binary model:
+#       - threshold 0.5
+#       - the OOF threshold stored in the bundle (chosen on training-set
+#         out-of-fold probabilities — the honest operating point)
+#       - the test-set-optimal threshold, labelled ORACLE (informational only,
+#         never used as a result)
+#   * Recall broken down by original class (L/R/V/A) and N specificity for each
+#     operating point, for both the binary model and the 5-class collapsed model.
+#   * All numbers written to results/binary/binary_eval_{tag}.json
 #
-# Input:  models/lgbm_binary_random.pkl
-#         models/lgbm_binary_ds1ds2.pkl
-#         models/lgbm_ds1ds2.pkl          (5-class, for comparison)
-#         datasets/processed/split_random.npz
-#         datasets/processed/split_ds1ds2.npz
+# Usage (from $ROOT):
+#   .venv/bin/python source/binaryLightGBM/evaluate_binary.py --tags random ds1ds2
 
 # %%
 
+import argparse
+import json
 import pickle
 import warnings
 from pathlib import Path
@@ -37,12 +36,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from lightgbm import LGBMClassifier
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
     confusion_matrix,
     f1_score,
+    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -53,250 +52,186 @@ warnings.filterwarnings("ignore")
 
 # %%
 
-_HERE      = Path(__file__).resolve().parent        # .../source/binaryLightGBM/
-FYP_ROOT   = _HERE.parent.parent                    # .../fyp/
+_HERE      = Path(__file__).resolve().parent
+FYP_ROOT   = _HERE.parent.parent
 PROC_DIR   = FYP_ROOT / "datasets" / "processed"
 MODEL_DIR  = FYP_ROOT / "models"
 RESULT_DIR = FYP_ROOT / "results" / "binary"
-
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 LABEL_ORDER = ["N", "L", "R", "V", "A"]
 LABEL_NAMES = {"N": "Normal", "L": "LBBB", "R": "RBBB", "V": "PVC", "A": "APC"}
 
-# Paper's reported binary anomaly numbers (clarityBase.txt §8.1)
 PAPER_BINARY = {"acc": 0.989, "prec": 0.931, "rec": 0.925, "f1": 0.928, "auc": 0.985}
 
 # %%
 
 
 def to_binary(y: np.ndarray) -> np.ndarray:
-    """N → 0, {L,R,V,A} → 1."""
     return np.where(y == "N", 0, 1).astype(int)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, proba: np.ndarray) -> dict:
-    """Full binary metrics at threshold 0.5."""
-    return {
+def compute_metrics(y_true, proba, thr, y5) -> dict:
+    y_pred = (proba >= thr).astype(int)
+    m = {
+        "threshold": float(thr),
         "acc":  float(accuracy_score(y_true, y_pred)),
-        "prec": float(precision_score(y_true, y_pred, pos_label=1, zero_division=0)),
-        "rec":  float(recall_score(y_true, y_pred, pos_label=1, zero_division=0)),
-        "f1":   float(f1_score(y_true, y_pred, pos_label=1, zero_division=0)),
+        "prec": float(precision_score(y_true, y_pred, zero_division=0)),
+        "rec":  float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1":   float(f1_score(y_true, y_pred, zero_division=0)),
         "auc":  float(roc_auc_score(y_true, proba)),
+        # recall by original class; for N this is specificity (pred 0)
+        "rec_by_class": {},
+        "n_by_class": {},
     }
+    for c in LABEL_ORDER:
+        mask = y5 == c
+        if mask.sum() == 0:
+            continue
+        hit = (y_pred[mask] == 0) if c == "N" else (y_pred[mask] == 1)
+        m["rec_by_class"][c] = float(hit.mean())
+        m["n_by_class"][c] = int(mask.sum())
+    return m
 
 
-def optimal_threshold_metrics(y_true: np.ndarray, proba: np.ndarray) -> tuple[float, dict]:
-    """
-    Find the threshold that maximises anomaly-class F1 on the test set.
-    Returns (threshold, metrics_dict).
-
-    Note: this is informational only — the threshold is chosen on the same
-    test set we evaluate on, so it is optimistic.  In a real deployment the
-    threshold should be chosen on a held-out validation set.
-    """
-    fpr, tpr, thresholds = roc_curve(y_true, proba)
-    best_t = 0.5
-    best_f1 = 0.0
-    for t in thresholds:
-        y_pred_t = (proba >= t).astype(int)
-        f = float(f1_score(y_true, y_pred_t, pos_label=1, zero_division=0))
-        if f > best_f1:
-            best_f1 = f
-            best_t = float(t)
-
-    y_opt = (proba >= best_t).astype(int)
-    return best_t, compute_metrics(y_true, y_opt, proba)
+def oracle_threshold(y_true, proba) -> float:
+    prec, rec, thr = precision_recall_curve(y_true, proba)
+    f1 = (2 * prec * rec / np.clip(prec + rec, 1e-12, None))[:-1]
+    return float(thr[int(np.nanargmax(f1))])
 
 
-def _binary_proba_from_5class(model_5class, X: np.ndarray) -> np.ndarray:
-    """
-    Collapse a 5-class model's output to anomaly probability.
-    Anomaly score = sum of P(L) + P(R) + P(V) + P(A).
-    """
-    proba   = model_5class.predict_proba(X)
-    classes = list(model_5class.classes_)
-    anom_cols = [i for i, c in enumerate(classes) if c != "N"]
+def _binary_proba_from_5class(model_5class, X):
+    proba = model_5class.predict_proba(X)
+    anom_cols = [i for i, c in enumerate(model_5class.classes_) if c != "N"]
     return proba[:, anom_cols].sum(axis=1)
 
 
 # %%
 
 
-def save_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, tag: str) -> None:
+def save_confusion_matrix(y_true, y_pred, tag):
     cm   = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm,
-                                  display_labels=["Normal", "Anomaly"])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Normal", "Anomaly"])
     fig, ax = plt.subplots(figsize=(5, 4))
     disp.plot(ax=ax, colorbar=False, cmap="Blues")
     ax.set_title(tag)
     fig.tight_layout()
-    out = RESULT_DIR / f"cm_{tag.replace(' ', '_')}.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(RESULT_DIR / f"cm_{tag.replace(' ', '_')}.png", dpi=150)
     plt.close(fig)
-    print(f"  Confusion matrix → {out.name}")
 
 
-def save_roc_curve(y_true: np.ndarray, proba_dict: dict, tag: str) -> None:
-    """Overlay ROC curves for multiple models on the same axes."""
+def save_roc_curve(y_true, proba_dict, tag):
     fig, ax = plt.subplots(figsize=(5, 5))
     for label, proba in proba_dict.items():
         fpr, tpr, _ = roc_curve(y_true, proba)
-        auc = roc_auc_score(y_true, proba)
-        ax.plot(fpr, tpr, label=f"{label} (AUC={auc:.3f})")
+        ax.plot(fpr, tpr, label=f"{label} (AUC={roc_auc_score(y_true, proba):.3f})")
     ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
-    ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
-    ax.set_title(f"ROC — {tag}")
+    ax.set_xlabel("FPR"); ax.set_ylabel("TPR"); ax.set_title(f"ROC — {tag}")
     ax.legend(loc="lower right", fontsize=8)
     fig.tight_layout()
-    out = RESULT_DIR / f"roc_{tag.replace(' ', '_')}.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(RESULT_DIR / f"roc_{tag.replace(' ', '_')}.png", dpi=150)
     plt.close(fig)
-    print(f"  ROC curve       → {out.name}")
 
 
 # %%
 
 
-def class_origin_breakdown(
-    y_5class: np.ndarray,
-    y_bin_pred: np.ndarray,
-    y_bin_true: np.ndarray,
-) -> None:
-    """
-    For each original 5-class label, print how many beats were correctly
-    classified (by the binary model) vs missed/false-alarmed.
-    """
-    print(f"\n  {'Class':<8}{'Name':<10}{'N_beats':>8}"
-          f"{'Correct':>9}{'Recall':>8}")
-    print(f"  {'─'*48}")
-    for cls in LABEL_ORDER:
-        mask = (y_5class == cls)
-        if mask.sum() == 0:
-            continue
-        if cls == "N":
-            # True negatives: predicted 0 where truth is 0
-            correct = int(((y_bin_pred == 0) & mask).sum())
-        else:
-            # True positives: predicted 1 where truth is 1
-            correct = int(((y_bin_pred == 1) & mask).sum())
-        total  = int(mask.sum())
-        recall = correct / total if total else 0.0
-        print(f"  {cls:<8}{LABEL_NAMES.get(cls, ''):<10}{total:>8,}"
-              f"{correct:>9,}{recall:>8.3f}")
-    print(f"  {'─'*48}")
+def _row(label, m):
+    rc = m["rec_by_class"]
+    print(f"  {label:<38} thr={m['threshold']:.3f}  Acc={m['acc']:.4f}  P={m['prec']:.4f}"
+          f"  R={m['rec']:.4f}  F1={m['f1']:.4f}  AUC={m['auc']:.4f}  |  "
+          + "  ".join(f"{c}={rc[c]:.3f}" for c in LABEL_ORDER if c in rc))
 
 
-# %%
+def evaluate_tag(tag: str) -> dict:
+    split_name = tag.split("_")[0]
+    print(f"\n{'═'*100}\nBinary evaluation — model tag: {tag}  (test split: {split_name})\n{'═'*100}")
+    data = np.load(PROC_DIR / f"split_{split_name}.npz", allow_pickle=True)
+    X_test, y5 = data["X_test"], data["y_test"]
+    y_test = to_binary(y5)
+    print(f"  Test set : {len(y_test):,} beats — Normal={int((y_test==0).sum()):,}  "
+          f"Anomaly={int((y_test==1).sum()):,}")
+    print("  Columns after '|': per-original-class recall (N column = specificity)")
+    print(f"  Paper (§8.1): Acc={PAPER_BINARY['acc']}  P={PAPER_BINARY['prec']}  "
+          f"R={PAPER_BINARY['rec']}  F1={PAPER_BINARY['f1']}  AUC={PAPER_BINARY['auc']}")
 
+    out = {"tag": tag, "paper": PAPER_BINARY}
+    proba_plot = {}
 
-def _print_metric_row(label: str, m: dict) -> None:
-    print(f"  {label:<30}"
-          f"  Acc={m['acc']:.4f}"
-          f"  P={m['prec']:.4f}"
-          f"  R={m['rec']:.4f}"
-          f"  F1={m['f1']:.4f}"
-          f"  AUC={m['auc']:.4f}")
-
-
-def evaluate_split(split_name: str) -> None:
-    print(f"\n{'═'*72}")
-    print(f"Binary evaluation — split: {split_name}")
-    print(f"{'═'*72}")
-
-    bin_pkl  = MODEL_DIR / f"lgbm_binary_{split_name}.pkl"
-    cls_pkl  = MODEL_DIR / f"lgbm_{split_name}.pkl"
-    npz_path = PROC_DIR  / f"split_{split_name}.npz"
-
-    if not npz_path.exists():
-        print(f"  [skip] {npz_path.name} not found — run split.py first.")
-        return
-
-    data     = np.load(npz_path, allow_pickle=True)
-    X_test   = data["X_test"]
-    y_test_5 = data["y_test"]          # 5-class labels (strings)
-    y_test   = to_binary(y_test_5)     # binary ground truth
-
-    n_normal = int((y_test == 0).sum())
-    n_anom   = int((y_test == 1).sum())
-    print(f"\n  Test set : {len(y_test):,} beats — "
-          f"Normal={n_normal:,}  Anomaly={n_anom:,}")
-
-    # ── Paper reference ───────────────────────────────────────────────────────
-    print(f"\n  {'─'*72}")
-    _print_metric_row("Paper (clarityBase.txt §8.1)", PAPER_BINARY)
-    print(f"  {'─'*72}")
-
-    # ── 5-class model collapsed to binary (for comparison) ───────────────────
-    proba_dict_plot: dict[str, np.ndarray] = {}
-
+    cls_pkl = MODEL_DIR / f"lgbm_{split_name}.pkl"
     if cls_pkl.exists():
         with open(cls_pkl, "rb") as f:
-            cls_bundle = pickle.load(f)
-        model_5 = cls_bundle["model"]
+            model_5 = pickle.load(f)["model"]
+        p5 = _binary_proba_from_5class(model_5, X_test)
+        # The 5-class model's own argmax decision (what evaluate.py reports)
+        pred5 = to_binary(np.asarray(model_5.predict(X_test)))
+        m5_arg = compute_metrics(y_test, pred5.astype(float), 0.5, y5)
+        m5_arg["auc"] = float(roc_auc_score(y_test, p5))
+        m5_arg["threshold"] = float("nan")
+        m5_05 = compute_metrics(y_test, p5, 0.5, y5)
+        _row("5-class collapsed (argmax)", m5_arg)
+        _row("5-class collapsed (sum P(anom)>=0.5)", m5_05)
+        out["five_class_argmax"] = m5_arg
+        out["five_class_sum05"] = m5_05
+        proba_plot["5-class collapsed"] = p5
 
-        proba_5  = _binary_proba_from_5class(model_5, X_test)
-        y_pred_5 = (proba_5 >= 0.5).astype(int)
-        m5       = compute_metrics(y_test, y_pred_5, proba_5)
-
-        _print_metric_row(f"5-class model (collapsed, {split_name})", m5)
-        save_confusion_matrix(y_test, y_pred_5, f"5class_collapsed_{split_name}")
-        proba_dict_plot["5-class collapsed"] = proba_5
-    else:
-        print(f"  [skip] 5-class model not found: {cls_pkl.name}")
-        m5 = None
-
-    # ── Dedicated binary model ───────────────────────────────────────────────
-    if not bin_pkl.exists():
-        print(f"\n  [skip] Binary model not found: {bin_pkl.name}")
-        print("  Run train_binary.py first.")
-        return
-
+    bin_pkl = MODEL_DIR / f"lgbm_binary_{tag}.pkl"
     with open(bin_pkl, "rb") as f:
-        bin_bundle = pickle.load(f)
-    model_bin = bin_bundle["model"]
-    cv_f1     = bin_bundle.get("cv_score", float("nan"))
+        bundle = pickle.load(f)
+    model = bundle["model"]
+    p = model.predict_proba(X_test)[:, 1]
+    proba_plot["binary"] = p
 
-    proba_bin  = model_bin.predict_proba(X_test)[:, 1]
-    y_pred_bin = (proba_bin >= 0.5).astype(int)
-    m_bin      = compute_metrics(y_test, y_pred_bin, proba_bin)
+    m05 = compute_metrics(y_test, p, 0.5, y5)
+    _row("Binary @0.5", m05)
+    out["binary_05"] = m05
+    if "threshold" in bundle:
+        m_oof = compute_metrics(y_test, p, bundle["threshold"], y5)
+        _row(f"Binary @OOF thr ({bundle.get('cv_kind')} CV)", m_oof)
+        out["binary_oofthr"] = m_oof
+        save_confusion_matrix(y_test, (p >= bundle["threshold"]).astype(int),
+                              f"binary_{tag}_oofthr")
+    t_or = oracle_threshold(y_test, p)
+    m_or = compute_metrics(y_test, p, t_or, y5)
+    _row("Binary @ORACLE test thr (not a result)", m_or)
+    out["binary_oracle"] = m_or
+    save_confusion_matrix(y_test, (p >= 0.5).astype(int), f"binary_{tag}_05")
+    save_roc_curve(y_test, proba_plot, tag)
 
-    _print_metric_row(f"Binary model (dedicated, {split_name})", m_bin)
-    print(f"  {'─'*72}")
-    print(f"  CV anomaly-F1 during training : {cv_f1:.4f}")
+    out["bundle"] = {k: v for k, v in bundle.items() if k != "model"}
+    print(f"  Training CV objective ({bundle.get('objective')}): {bundle.get('cv_score'):.4f}   "
+          f"OOF AUC: {bundle.get('oof_auc', float('nan')):.4f}")
 
-    save_confusion_matrix(y_test, y_pred_bin, f"binary_model_{split_name}")
-    proba_dict_plot["binary dedicated"] = proba_bin
-    save_roc_curve(y_test, proba_dict_plot, split_name)
+    # Per-record view on the test split (where do the misses come from?)
+    rec_ids = data["record_ids_test"]
+    thr = bundle.get("threshold", 0.5)
+    per_rec = {}
+    for r in sorted(set(rec_ids)):
+        mask = rec_ids == r
+        yt, yp = y_test[mask], (p[mask] >= thr).astype(int)
+        per_rec[str(r)] = {
+            "n": int(mask.sum()), "n_anom": int(yt.sum()),
+            "tp": int(((yp == 1) & (yt == 1)).sum()), "fp": int(((yp == 1) & (yt == 0)).sum()),
+            "fn": int(((yp == 0) & (yt == 1)).sum()),
+        }
+    out["per_record_at_used_thr"] = per_rec
+    worst = sorted(per_rec.items(), key=lambda kv: -(kv[1]["fn"] + kv[1]["fp"]))[:8]
+    print("  Records with most errors (at OOF thr):  " +
+          ", ".join(f"{r}: FN={v['fn']} FP={v['fp']}" for r, v in worst))
 
-    # ── Optimal threshold ────────────────────────────────────────────────────
-    opt_t, m_opt = optimal_threshold_metrics(y_test, proba_bin)
-    print(f"\n  Optimal threshold : {opt_t:.4f}  (maximises anomaly-F1 on test set)")
-    _print_metric_row("Binary model (optimal threshold)", m_opt)
-    print("  Note: optimal threshold chosen on test set — informational only.")
-
-    # ── Class-origin breakdown ───────────────────────────────────────────────
-    print(f"\n  Class-origin recall (binary model, default threshold):")
-    class_origin_breakdown(y_test_5, y_pred_bin, y_test)
-
-    # ── Improvement summary ──────────────────────────────────────────────────
-    if m5 is not None:
-        delta_f1  = m_bin["f1"]  - m5["f1"]
-        delta_auc = m_bin["auc"] - m5["auc"]
-        delta_acc = m_bin["acc"] - m5["acc"]
-        print(f"\n  Binary vs 5-class-collapsed ΔF1={delta_f1:+.4f}  "
-              f"ΔAUC={delta_auc:+.4f}  ΔAcc={delta_acc:+.4f}")
+    (RESULT_DIR / f"binary_eval_{tag}.json").write_text(json.dumps(out, indent=2, default=str))
+    return out
 
 
 # %%
 
-
 if __name__ == "__main__":
-    print("\nMIT-BIH Binary LightGBM Evaluation")
-    print("=" * 72)
-    print("Comparing: paper / 5-class collapsed / dedicated binary model")
-
-    for split_name in ("random", "ds1ds2"):
-        evaluate_split(split_name)
-
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tags", nargs="+", default=["random", "ds1ds2"])
+    a = ap.parse_args()
+    for t in a.tags:
+        if not (MODEL_DIR / f"lgbm_binary_{t}.pkl").exists():
+            print(f"[skip] lgbm_binary_{t}.pkl not found")
+            continue
+        evaluate_tag(t)
     print("\nDone.")

@@ -102,6 +102,7 @@ def _train_focal(cfg: dict, gamma: float, seeds: list[int],
         macro_f1_cb = MacroF1Callback(val["X_ecg"], val["X_rr"], val["y"], n_classes)
 
         callbacks = [
+            macro_f1_cb,   # must be first so val_macro_f1 is in logs before EarlyStopping reads it
             keras.callbacks.EarlyStopping(
                 monitor="val_macro_f1", mode="max",
                 patience=int(t_cfg["early_stop_patience"]),
@@ -115,7 +116,6 @@ def _train_focal(cfg: dict, gamma: float, seeds: list[int],
                 min_lr=float(t_cfg["lr_min"]),
                 verbose=0,
             ),
-            macro_f1_cb,
         ]
 
         t0 = time.perf_counter()

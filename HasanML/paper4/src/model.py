@@ -223,22 +223,24 @@ class KANFormer(nn.Module):
         m = cfg["model"]
         p = cfg["preprocess"]
 
-        d_model     = int(m["d_model"])
-        n_heads     = int(m["n_heads"])
-        n_layers    = int(m["n_layers"])
-        d_ff        = int(m["ffn_hidden"])
-        dropout     = float(m["dropout"])
-        drop_path   = float(m["stoch_depth"])
-        channels    = list(m["cnn_channels"])
-        ms_kernels  = list(m["ms_kernels"])
-        se_red      = int(m["se_reduction"])
+        # Defaults mirror configs/default.yaml so partial configs still build.
+        d_model     = int(m.get("d_model", 128))
+        n_heads     = int(m.get("n_heads", 4))
+        n_layers    = int(m.get("n_layers", 3))
+        d_ff        = int(m.get("ffn_hidden", 2 * d_model))
+        dropout     = float(m.get("dropout", 0.1))
+        drop_path   = float(m.get("stoch_depth", 0.1))
+        channels    = list(m.get("cnn_channels", [32, 64, d_model]))
+        ms_kernels  = list(m.get("ms_kernels", [3, 7, 15]))
+        se_red      = int(m.get("se_reduction", 8))
         head_type   = str(m.get("head", "kan"))
-        grid_size   = int(m["kan_grid_size"])
-        spline_order= int(m["kan_spline_order"])
-        grid_range  = tuple(m["kan_grid_range"])
-        kan_hidden  = int(m["kan_hidden"])
-        head_drop   = float(m["head_dropout"])
-        n_rr        = int(cfg["rr"]["n_features"])
+        grid_size   = int(m.get("kan_grid_size", 5))
+        spline_order= int(m.get("kan_spline_order", 3))
+        grid_range  = tuple(m.get("kan_grid_range", [-1.0, 1.0]))
+        kan_hidden  = int(m.get("kan_hidden", 64))
+        head_drop   = float(m.get("head_dropout", 0.2))
+        # n_rr = 0 (ablation A4) disables the RR token and the RR head shortcut.
+        n_rr        = int(cfg.get("rr", {}).get("n_features", 6))
         ctx_len     = int(p.get("context_len", 1080))
 
         self.d_model  = d_model
@@ -256,7 +258,8 @@ class KANFormer(nn.Module):
         # Beat tokens: 32; context tokens: 135 (or 0); CLS: 1; RR token: 1
         beat_tokens = 256 // (2 ** len(channels))
         ctx_tokens  = (ctx_len // (2 ** len(channels))) if self.has_ctx else 0
-        n_tokens    = 1 + beat_tokens + ctx_tokens + 1   # CLS + beat + ctx + RR
+        rr_tokens   = 1 if n_rr > 0 else 0
+        n_tokens    = 1 + beat_tokens + ctx_tokens + rr_tokens   # CLS + beat + ctx + RR
         self.n_tokens = n_tokens
 
         # Learnable CLS token (broadcast over batch dimension in forward)
@@ -267,11 +270,27 @@ class KANFormer(nn.Module):
         self.pos_embed = nn.Embedding(n_tokens, d_model)
         self.seg_embed = nn.Embedding(4, d_model)
         self.register_buffer("pos_ids", torch.arange(n_tokens))
-        seg = torch.tensor([0] + [1]*beat_tokens + [2]*ctx_tokens + [3])
+        seg = torch.tensor([0] + [1]*beat_tokens + [2]*ctx_tokens + [3]*rr_tokens)
         self.register_buffer("seg_ids", seg)
 
         # RR token projection
-        self.rr_proj = nn.Linear(n_rr, d_model)
+        # model.rr_branch (2026-11-19, kanformer2): dedicated RR encoder
+        # BN -> Linear -> GELU -> Linear -> GELU (width rr_hidden).  Its output
+        # feeds the RR token, replaces the raw-RR head shortcut, and (with
+        # model.rr_aux_logits) adds a direct RR-only logit path.  Default off,
+        # so old checkpoints/configs build the identical network.
+        self.rr_branch = bool(m.get("rr_branch", False)) and n_rr > 0
+        rr_hidden = int(m.get("rr_hidden", 64))
+        if self.rr_branch:
+            self.rr_enc = nn.Sequential(
+                nn.BatchNorm1d(n_rr), nn.Linear(n_rr, rr_hidden), nn.GELU(),
+                nn.Linear(rr_hidden, rr_hidden), nn.GELU())
+            rr_out = rr_hidden
+        else:
+            rr_out = n_rr
+        self.rr_proj = nn.Linear(rr_out, d_model) if n_rr > 0 else None
+        self.rr_aux = (nn.Linear(rr_hidden, n_classes)
+                       if self.rr_branch and bool(m.get("rr_aux_logits", False)) else None)
 
         # Transformer encoder
         self.layers = nn.ModuleList([
@@ -281,7 +300,7 @@ class KANFormer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
         # Classification head
-        head_in = d_model * 2 + n_rr   # CLS + mean-pool + RR direct
+        head_in = d_model * 2 + rr_out   # CLS + mean-pool + RR direct (raw or encoded)
         self.head_norm = nn.LayerNorm(head_in)
 
         if head_type == "kan":
@@ -327,16 +346,24 @@ class KANFormer(nn.Module):
             ctx_tok = self.ctx_stem(context)
         else:
             # Ablation: pad with zeros if context disabled
-            ctx_len_tok = self.n_tokens - 1 - beat_tok.shape[1] - 1
+            ctx_len_tok = (self.n_tokens - 1 - beat_tok.shape[1]
+                           - (1 if self.n_rr > 0 else 0))
             ctx_tok = torch.zeros(B, max(0, ctx_len_tok),
-                                  self.d_model, device=device)
+                                  self.d_model, device=device, dtype=beat_tok.dtype)
 
-        # RR token: (B, 1, d_model)
-        if rr is not None:
+        # RR token: (B, 1, d_model).  With n_rr == 0 (ablation A4) the RR
+        # inputs are ignored entirely (no token, no head shortcut).
+        if self.n_rr == 0:
+            rr_tok = beat_tok.new_zeros(B, 0, self.d_model)
+            rr = beat_tok.new_zeros(B, 0)
+        elif rr is not None:
+            rr = rr[:, :self.n_rr]
+            if self.rr_branch:
+                rr = self.rr_enc(rr.float())
             rr_tok = self.rr_proj(rr).unsqueeze(1)
         else:
             rr_tok = torch.zeros(B, 1, self.d_model, device=device)
-            rr = torch.zeros(B, self.n_rr, device=device)
+            rr = torch.zeros(B, self.rr_proj.in_features, device=device)
 
         # CLS token: (B, 1, d_model)
         cls = self.cls_token.expand(B, -1, -1)
@@ -357,12 +384,15 @@ class KANFormer(nn.Module):
         # Head inputs: CLS output + mean pool over all tokens + direct RR features
         cls_out  = tokens[:, 0, :]                   # (B, d_model)
         mean_out = tokens.mean(dim=1)                 # (B, d_model)
-        head_in  = torch.cat([cls_out, mean_out, rr], dim=1)  # (B, 2*d_model + n_rr)
+        head_in  = torch.cat([cls_out, mean_out, rr.to(cls_out.dtype)], dim=1)  # (B, 2*d_model + n_rr)
 
         # Squash to (-1, 1) for the B-spline grid
         head_in = torch.tanh(self.head_norm(head_in))
 
-        return self.head(head_in)   # (B, n_classes) logits
+        out = self.head(head_in)   # (B, n_classes) logits
+        if self.rr_aux is not None:
+            out = out + self.rr_aux(rr.to(out.dtype))
+        return out
 
 
 # %%

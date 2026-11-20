@@ -47,29 +47,91 @@ except ImportError:
 
 
 # %%
+def _input_order(model) -> list:
+    """
+    Order of the inputs in the converted TFLite graph, as 'ecg'/'rr'.
+    The converter does NOT keep the Keras [ecg_in, rr_in] order (it put rr_in
+    first here), and the representative dataset must follow the TFLite order;
+    feeding [ecg, rr] blindly made calibration crash ("CONV_2D input dims
+    3 != 4" / "RESHAPE 4 != 32").
+    """
+    interp = tf.lite.Interpreter(model_content=convert_float32(model))
+    return ["ecg" if len(d["shape"]) == 3 else "rr" for d in interp.get_input_details()]
+
+
 def _representative_dataset_fn(X_ecg: np.ndarray, X_rr: np.ndarray,
-                                n: int = 500):
+                                n: int = 500, order=("ecg", "rr")):
     """
     Generator of representative inputs for full-int8 PTQ calibration.
     Draws `n` samples from DS1-train (never DS2).
     """
     idx = np.random.default_rng(0).choice(len(X_ecg), min(n, len(X_ecg)), replace=False)
     for i in idx:
-        yield [
-            X_ecg[i:i+1].astype(np.float32),
-            X_rr[i:i+1].astype(np.float32),
-        ]
+        arrs = {"ecg": X_ecg[i:i+1].astype(np.float32), "rr": X_rr[i:i+1].astype(np.float32)}
+        yield [arrs[k] for k in order]
+
+
+def _converter(model):
+    """
+    TFLiteConverter on a batch-1 concrete function.  from_keras_model keeps a
+    dynamic batch dimension, which turns every Reshape into SHAPE +
+    STRIDED_SLICE + PACK + RESHAPE ops (useless work and extra op resolvers on
+    the MCU).  The MCU always runs one beat per invoke, so fix batch=1.
+    """
+    specs = [tf.TensorSpec([1] + list(t.shape[1:]), tf.float32,
+                           name=t.name.split(":")[0]) for t in model.inputs]
+    fn = tf.function(lambda *xs: model(list(xs), training=False))
+    cf = fn.get_concrete_function(*specs)
+    return tf.lite.TFLiteConverter.from_concrete_functions([cf], model)
+
+
+def _best_holdout_f1_callback(X_ecg_val, X_rr_val, y_val, n_classes, start_epoch=0):
+    """
+    Keeps the weights of the epoch with the best macro-F1 on the DS1 hold-out
+    (only epochs >= start_epoch, e.g. after the pruning schedule has reached
+    its final sparsity).  Call cb.restore() after fit().  Same selection
+    signal as the float model's early stopping (src.train.MacroF1Callback).
+    """
+    from tensorflow import keras
+
+    class _CB(keras.callbacks.Callback):
+        def __init__(self):
+            super().__init__()
+            self.best, self.best_w, self.best_epoch, self.hist = -1.0, None, -1, []
+
+        def on_epoch_end(self, epoch, logs=None):
+            pred = np.argmax(self.model.predict([X_ecg_val, X_rr_val], batch_size=4096,
+                                                verbose=0), axis=1)
+            f1s = []
+            for c in range(n_classes):
+                tp = np.sum((y_val == c) & (pred == c))
+                fp = np.sum((y_val != c) & (pred == c))
+                fn = np.sum((y_val == c) & (pred != c))
+                f1s.append(2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0)
+            f1 = float(np.mean(f1s))
+            self.hist.append(f1)
+            if epoch >= start_epoch and f1 > self.best:
+                self.best, self.best_epoch = f1, epoch
+                self.best_w = [w.copy() for w in self.model.get_weights()]
+
+        def restore(self):
+            if self.best_w is not None:
+                self.model.set_weights(self.best_w)
+            log.info("best hold-out macro-F1 %.4f at epoch %d (history %s)",
+                     self.best, self.best_epoch, [round(x, 4) for x in self.hist])
+
+    return _CB()
 
 
 def convert_float32(model) -> bytes:
     """TFLite float32 — identical to Keras inference."""
-    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    conv = _converter(model)
     return conv.convert()
 
 
 def convert_float16(model) -> bytes:
     """TFLite float16 — weights and activations in fp16; minimal accuracy change."""
-    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    conv = _converter(model)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
     conv.target_spec.supported_types = [tf.float16]
     return conv.convert()
@@ -77,7 +139,7 @@ def convert_float16(model) -> bytes:
 
 def convert_dynamic(model) -> bytes:
     """Dynamic-range int8 quantisation — weights int8, activations float at run time."""
-    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    conv = _converter(model)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
     return conv.convert()
 
@@ -89,10 +151,11 @@ def convert_int8_ptq(model, X_ecg_repr: np.ndarray, X_rr_repr: np.ndarray,
     Both weights and activations are quantised; no floating-point ops remain.
     The representative dataset should come from DS1-train ONLY.
     """
-    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    order = _input_order(model)
+    conv = _converter(model)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
     conv.representative_dataset = lambda: _representative_dataset_fn(
-        X_ecg_repr, X_rr_repr, n_repr
+        X_ecg_repr, X_rr_repr, n_repr, order
     )
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     conv.inference_input_type  = tf.int8
@@ -104,7 +167,9 @@ def convert_int8_qat(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
                      y_tr: np.ndarray, X_ecg_val: np.ndarray, X_rr_val: np.ndarray,
                      y_val: np.ndarray, n_classes: int,
                      X_ecg_repr: np.ndarray, X_rr_repr: np.ndarray,
-                     cfg: dict) -> bytes:
+                     cfg: dict, class_weight: Optional[dict] = None,
+                     epochs: int = 10, lr: float = 1e-5,
+                     rr_clip: Optional[float] = None) -> bytes:
     """
     Quantisation-aware training (QAT) int8 export using tensorflow_model_optimization.
     The paper used QKeras; here we use tfmot as a drop-in [assumption].
@@ -112,6 +177,13 @@ def convert_int8_qat(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
     QAT inserts fake-quant nodes during fine-tuning, minimising the accuracy gap
     that full-integer PTQ introduces by letting the model adapt to the reduced
     precision.
+
+    tfmot only works with legacy tf.keras (tf_keras, TF_USE_LEGACY_KERAS=1);
+    `model` must therefore be a tf_keras model (see 1DCNN/export/export_tflite.py,
+    which rebuilds the Keras-3 model in a tf_keras venv).
+
+    class_weight : pass the same weights the float model was trained with
+                   (e.g. balanced); fine-tuning without them drifts toward N.
     """
     if not _TFMOT_OK:
         log.warning("tfmot not available; skipping QAT export")
@@ -125,7 +197,7 @@ def convert_int8_qat(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
     # Apply QAT to the entire model
     qat_model = tfmot.quantization.keras.quantize_model(model)
     qat_model.compile(
-        optimizer=keras.optimizers.Adam(1e-5),   # low LR for fine-tuning
+        optimizer=keras.optimizers.Adam(lr),   # low LR for fine-tuning
         loss="categorical_crossentropy",
         metrics=["accuracy"],
     )
@@ -133,19 +205,32 @@ def convert_int8_qat(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
     y_tr_oh  = to_categorical(y_tr,  n_classes)
     y_val_oh = to_categorical(y_val, n_classes)
 
+    if rr_clip is not None:
+        # RR features have rare huge outliers (up to ~100 in DS1-train) that
+        # blow up QAT's moving-average input range (scale 0.40 -> RR crushed
+        # to a few levels).  Int8 inference saturates there anyway.
+        X_rr_tr  = np.clip(X_rr_tr,  0.0, rr_clip)
+        X_rr_val = np.clip(X_rr_val, 0.0, rr_clip)
+        X_rr_repr = np.clip(X_rr_repr, 0.0, rr_clip)
+    best_cb = _best_holdout_f1_callback(X_ecg_val, X_rr_val, y_val, n_classes)
     qat_model.fit(
         [X_ecg_tr, X_rr_tr], y_tr_oh,
         validation_data=([X_ecg_val, X_rr_val], y_val_oh),
-        epochs=10,            # short fine-tuning [assumption]
+        epochs=int(epochs),   # short fine-tuning [assumption]
         batch_size=int(t_cfg["batch_size"]),
+        class_weight=class_weight,
+        callbacks=[best_cb],
         verbose=0,
     )
+    best_cb.restore()
+    convert_int8_qat.last_history = best_cb.hist
 
     # Convert to int8
-    conv = tf.lite.TFLiteConverter.from_keras_model(qat_model)
+    order = _input_order(qat_model)
+    conv = _converter(qat_model)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
     conv.representative_dataset = lambda: _representative_dataset_fn(
-        X_ecg_repr, X_rr_repr
+        X_ecg_repr, X_rr_repr, 500, order
     )
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     conv.inference_input_type  = tf.int8
@@ -157,7 +242,10 @@ def convert_pruned_int8(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
                         y_tr: np.ndarray, X_ecg_val: np.ndarray, X_rr_val: np.ndarray,
                         y_val: np.ndarray, n_classes: int,
                         X_ecg_repr: np.ndarray, X_rr_repr: np.ndarray,
-                        cfg: dict) -> bytes:
+                        cfg: dict, class_weight: Optional[dict] = None,
+                        epochs: int = 20, lr: float = 1e-4,
+                        return_model: bool = False,
+                        rr_clip: Optional[float] = None):
     """
     50 % magnitude pruning + int8 PTQ.
     Pruning removes small weights to increase sparsity; the remaining non-zero
@@ -188,7 +276,7 @@ def convert_pruned_int8(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
         model, pruning_schedule=pruning_schedule
     )
     pruned_model.compile(
-        optimizer=keras.optimizers.Adam(1e-4),
+        optimizer=keras.optimizers.Adam(lr),
         loss="categorical_crossentropy",
         metrics=["accuracy"],
     )
@@ -196,32 +284,60 @@ def convert_pruned_int8(model, X_ecg_tr: np.ndarray, X_rr_tr: np.ndarray,
     y_tr_oh  = to_categorical(y_tr,  n_classes)
     y_val_oh = to_categorical(y_val, n_classes)
 
+    if rr_clip is not None:
+        X_rr_tr  = np.clip(X_rr_tr,  0.0, rr_clip)
+        X_rr_val = np.clip(X_rr_val, 0.0, rr_clip)
+    bs = int(t_cfg["batch_size"])
+    steps_per_epoch = int(np.ceil(len(y_tr) / bs))
+    # only keep epochs where the final sparsity has been reached
+    start_epoch = int(np.ceil(end_step / steps_per_epoch))
+    best_cb = _best_holdout_f1_callback(X_ecg_val, X_rr_val, y_val, n_classes,
+                                        start_epoch=start_epoch)
     pruned_model.fit(
         [X_ecg_tr, X_rr_tr], y_tr_oh,
         validation_data=([X_ecg_val, X_rr_val], y_val_oh),
-        epochs=20,
-        batch_size=int(t_cfg["batch_size"]),
-        callbacks=[tfmot.sparsity.keras.UpdatePruningStep()],
+        epochs=int(epochs),
+        batch_size=bs,
+        callbacks=[tfmot.sparsity.keras.UpdatePruningStep(), best_cb],
+        class_weight=class_weight,
         verbose=0,
     )
+    best_cb.restore()
+    convert_pruned_int8.last_history = best_cb.hist
 
     # Strip pruning wrappers and convert to int8
     stripped = tfmot.sparsity.keras.strip_pruning(pruned_model)
-    return convert_int8_ptq(stripped, X_ecg_repr, X_rr_repr)
+    tfl = convert_int8_ptq(stripped, X_ecg_repr, X_rr_repr)
+    return (tfl, stripped) if return_model else tfl
+
+
+def weight_sparsity(model) -> dict:
+    """Fraction of exactly-zero entries in each kernel (bias/BN excluded)."""
+    out = {}
+    for layer in model.layers:
+        for w in layer.weights:
+            if "kernel" in w.name:
+                a = np.asarray(w.numpy())
+                out[layer.name] = float((a == 0).mean())
+    return out
 
 
 # %%
 def evaluate_tflite(tflite_bytes: bytes,
                     X_ecg: np.ndarray, X_rr: np.ndarray,
-                    y_true: np.ndarray) -> dict:
+                    y_true: np.ndarray, return_proba: bool = False,
+                    num_threads: int = 1) -> dict:
     """
     Run inference with the TFLite interpreter and compute accuracy + macro F1.
     Handles int8 input/output by applying the quantisation scale/zero_point.
+    Inference is one beat per invoke() (batch 1), as on the MCU.
+    return_proba=True adds 'proba' (n, K) (dequantised) and 'us_per_beat'
+    (mean wall-clock invoke() time incl. set/get tensor, host CPU).
     """
     if not tflite_bytes:
         return {}
 
-    interp = tf.lite.Interpreter(model_content=tflite_bytes)
+    interp = tf.lite.Interpreter(model_content=tflite_bytes, num_threads=num_threads)
     interp.allocate_tensors()
     inp_details  = interp.get_input_details()
     out_details  = interp.get_output_details()
@@ -232,7 +348,7 @@ def evaluate_tflite(tflite_bytes: bytes,
             scale, zp = detail["quantization"]
             if scale == 0.0:
                 scale = 1.0
-            return (data / scale + zp).clip(-128, 127).astype(np.int8)
+            return np.round(data / scale + zp).clip(-128, 127).astype(np.int8)  # round, not truncate
         return data.astype(np.float32)
 
     def _dequantise(data, detail):
@@ -256,7 +372,9 @@ def evaluate_tflite(tflite_bytes: bytes,
                     [d["shape"] for d in inp_details])
         return {}
 
+    import time as _time
     preds, all_proba = [], []
+    t_start = _time.perf_counter()
     for i in range(len(y_true)):
         ecg_i = _quantise(X_ecg[i:i+1], ecg_detail)
         rr_i  = _quantise(X_rr[i:i+1],  rr_detail)
@@ -267,6 +385,7 @@ def evaluate_tflite(tflite_bytes: bytes,
         all_proba.append(out[0])
         preds.append(int(np.argmax(out[0])))
 
+    us_per_beat = 1e6 * (_time.perf_counter() - t_start) / max(1, len(y_true))
     preds     = np.array(preds)
     all_proba = np.array(all_proba)
     acc       = float((preds == y_true).mean())
@@ -274,7 +393,73 @@ def evaluate_tflite(tflite_bytes: bytes,
     from sklearn.metrics import f1_score
     f1 = float(f1_score(y_true, preds, average="macro", zero_division=0))
 
-    return {"accuracy": acc, "macro_f1": f1, "size_bytes": len(tflite_bytes)}
+    out = {"accuracy": acc, "macro_f1": f1, "size_bytes": len(tflite_bytes)}
+    if return_proba:
+        out["proba"] = all_proba
+        out["us_per_beat"] = us_per_beat
+    return out
+
+
+def tflite_memory_estimate(tflite_bytes: bytes) -> dict:
+    """
+    Host-side estimate of TFLite-Micro RAM needs from the flatbuffer graph.
+
+    activ_sum_bytes  : sum of all non-constant tensors (inputs, intermediates,
+                       outputs) — upper bound with no buffer re-use.
+    activ_peak_bytes : greedy liveness peak — at each op, bytes of every tensor
+                       produced earlier (or a graph input) that is still needed
+                       by this or a later op, plus this op's outputs.  This is
+                       what TFLM's GreedyMemoryPlanner approaches (it can be a
+                       little higher because of 16-byte alignment/fragmentation).
+    The real TFLM tensor arena = activ_peak + per-op persistent buffers
+    (quant multipliers etc.) + TfLiteTensor/NodeAndRegistration structs; add a
+    few KB of head-room and confirm with MicroInterpreter::arena_used_bytes().
+    """
+    interp = tf.lite.Interpreter(model_content=tflite_bytes)
+    interp.allocate_tensors()
+    tdet = {d["index"]: d for d in interp.get_tensor_details()}
+    ops = interp._get_ops_details()
+    const = set()
+    try:
+        # constant tensors have a buffer in the flatbuffer; detect by trying to read
+        # them before any invoke: variable tensors are produced by an op
+        produced = {t for op in ops for t in op["outputs"]}
+        graph_in = {d["index"] for d in interp.get_input_details()}
+        const = set(tdet) - produced - graph_in
+    except Exception:  # pragma: no cover
+        pass
+
+    def nbytes(i):
+        d = tdet[i]
+        return int(np.prod(d["shape"])) * np.dtype(d["dtype"]).itemsize
+
+    act = [i for i in tdet if i not in const]
+    last_use = {}
+    for k, op in enumerate(ops):
+        for t in op["inputs"]:
+            if t >= 0 and t not in const:
+                last_use[t] = k
+    out_idx = {d["index"] for d in interp.get_output_details()}
+    for t in out_idx:
+        last_use[t] = len(ops)
+    first_def = {t: -1 for t in act}
+    for k, op in enumerate(ops):
+        for t in op["outputs"]:
+            first_def[t] = k
+    peak = 0
+    for k in range(len(ops)):
+        live = sum(nbytes(t) for t in act
+                   if first_def.get(t, -1) <= k and last_use.get(t, -1) >= k)
+        peak = max(peak, live)
+    const_bytes = sum(nbytes(i) for i in const)
+    return {
+        "n_ops": len(ops),
+        "op_types": sorted({op["op_name"] for op in ops}),
+        "activ_sum_bytes": int(sum(nbytes(t) for t in act)),
+        "activ_peak_bytes": int(peak),
+        "const_tensor_bytes": int(const_bytes),
+        "n_tensors": len(tdet),
+    }
 
 
 # %%
@@ -292,18 +477,20 @@ def generate_c_header(tflite_bytes: bytes, model_name: str,
         f"// Auto-generated by export.py — Farag (2023) tiny 1D-CNN",
         f"// Model: {model_name}",
         f"// Size: {len(tflite_bytes)} bytes",
+        f"// Same byte layout as `xxd -i`; alignas(16) because TFLite Micro reads the",
+        f"// flatbuffer in place and needs it aligned. `const` keeps it in flash.",
         f"",
         f"#ifndef {var_name.upper()}_H",
         f"#define {var_name.upper()}_H",
         f"",
-        f"const unsigned char {var_name}[] = {{",
+        f"alignas(16) const unsigned char {var_name}[] = {{",
     ]
-    hex_vals = [f"  0x{b:02x}" for b in tflite_bytes]
-    # 12 hex values per line
+    hex_vals = [f"0x{b:02x}" for b in tflite_bytes]
+    # 12 hex values per line (xxd -i layout)
     for i in range(0, len(hex_vals), 12):
         chunk = hex_vals[i:i+12]
         suffix = "," if i + 12 < len(hex_vals) else ""
-        lines.append(", ".join(chunk) + suffix)
+        lines.append("  " + ", ".join(chunk) + suffix)
     lines += [
         f"}};",
         f"const unsigned int {var_name}_len = {len(tflite_bytes)};",

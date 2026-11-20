@@ -155,16 +155,38 @@ def train_one(
 
     nk         = int(i_cfg["nk"])
     n_channels = X_ecg_tr.shape[-1]
+    arch       = str(m_cfg.get("arch", "compact"))
+    # Number of Conv1D filters follows the MF kernel when one is supplied
+    # (13 by default; 11 for 3-class when templates.match_classes is true).
+    n_filters  = int(kernel_mf.shape[-1]) if kernel_mf is not None else int(m_cfg.get("n_filters", 13))
+    rr_units   = (list(m_cfg.get("table3_rr_units", [32, 16, 8])) if arch == "table3"
+                  else list(m_cfg["rr_dense_units"]))
     model      = build_model(
         nk=nk,
         n_channels=n_channels,
         n_classes=n_classes,
-        rr_dense_units=list(m_cfg["rr_dense_units"]),
+        rr_dense_units=rr_units,
         activation=str(m_cfg["activation"]),
         padding=str(m_cfg["padding"]),
         use_bias=bool(m_cfg["use_bias"]),
+        arch=arch,
+        n_filters=n_filters,
+        input_len=int(X_ecg_tr.shape[1]),
+        n_rr=int(X_rr_tr.shape[1]),
     )
-    validate_param_count(model, nk, n_channels, n_classes)
+    if arch == "compact":
+        validate_param_count(model, nk, n_channels, n_classes)
+    else:
+        # table3 counts are fixed by the paper (1267/1619 for 11 filters);
+        # other filter counts (e.g. 3 AAMI templates) are legitimate ablations.
+        log.info("params: total=%d (arch=%s, filters=%d, NK=%d, C=%d)",
+                 model.count_params(), arch, n_filters, nk, n_channels)
+
+    # Templates may be longer than the kernel when the ECG input is not
+    # centre-cropped (input.crop_input: false): crop the template centre.
+    if kernel_mf is not None and kernel_mf.shape[0] > nk:
+        m0 = (kernel_mf.shape[0] - nk) // 2
+        kernel_mf = kernel_mf[m0:m0 + nk]
 
     # Apply matched-filter initialisation if requested
     if t_name in ("mf_trainable", "mf_frozen") and kernel_mf is not None:
@@ -178,6 +200,13 @@ def train_one(
     class_weight = None
     if str(t_cfg.get("class_weight", "none")) == "balanced":
         class_weight = compute_class_weights(y_tr, n_classes)
+        # training.class_weight_power p (default 1 = sklearn 'balanced'):
+        # w_c = balanced_c ** p, i.e. proportional to (1/freq_c)^p.
+        _p = float(t_cfg.get("class_weight_power", 1.0))
+        if _p != 1.0:
+            class_weight = {c: float(w) ** _p for c, w in class_weight.items()}
+            log.info("class weights ^%.2f: %s", _p,
+                     {k: f"{v:.3f}" for k, v in sorted(class_weight.items())})
 
     y_tr_oh  = to_categorical(y_tr,  n_classes)
     y_val_oh = to_categorical(y_val, n_classes)
@@ -186,32 +215,41 @@ def train_one(
     # it stays dominated by N and triggers early stopping before minority classes
     # are learned.  Switch to macro-F1 on val set as the early stopping signal.
     use_balanced = str(t_cfg.get("class_weight", "none")) == "balanced"
-    es_monitor = "val_macro_f1" if use_balanced else "val_loss"
-    es_mode    = "max"          if use_balanced else "min"
+    es_choice  = str(t_cfg.get("early_stop_monitor", "auto"))   # auto | val_loss | val_macro_f1
+    if es_choice == "auto":
+        es_monitor = "val_macro_f1" if use_balanced else "val_loss"
+    else:
+        es_monitor = es_choice
+    es_mode    = "max" if es_monitor == "val_macro_f1" else "min"
 
     macro_f1_cb = (
         MacroF1Callback(X_ecg_val, X_rr_val, y_val, n_classes)
-        if use_balanced else None
+        if es_monitor == "val_macro_f1" else None
     )
 
-    callbacks = [
+    # MacroF1Callback must come FIRST so it populates val_macro_f1 in logs
+    # before EarlyStopping reads it in the same on_epoch_end pass.
+    callbacks = []
+    if macro_f1_cb is not None:
+        callbacks.append(macro_f1_cb)
+    callbacks.append(
         keras.callbacks.EarlyStopping(
             monitor=es_monitor,
             mode=es_mode,
             patience=int(t_cfg["early_stop_patience"]),
             restore_best_weights=bool(t_cfg["restore_best_weights"]),
             verbose=0,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=float(t_cfg["lr_reduce_factor"]),
-            patience=int(t_cfg["lr_reduce_patience"]),
-            min_lr=float(t_cfg["lr_min"]),
-            verbose=0,
-        ),
-    ]
-    if macro_f1_cb is not None:
-        callbacks.append(macro_f1_cb)
+        ))
+    # lr_schedule: plateau (default, ReduceLROnPlateau on val_loss) | none
+    if str(t_cfg.get("lr_schedule", "plateau")) == "plateau":
+        callbacks.append(
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=float(t_cfg["lr_reduce_factor"]),
+                patience=int(t_cfg["lr_reduce_patience"]),
+                min_lr=float(t_cfg["lr_min"]),
+                verbose=0,
+            ))
 
     t0 = time.perf_counter()
     history = model.fit(

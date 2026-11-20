@@ -144,6 +144,9 @@ def process_record(name: str, cfg: dict, split: str = "ds1_train") -> dict:
         local_window=int(rr_cfg["local_window"]),
         global_window=int(rr_cfg["global_window"]),
         use_post_rr=bool(rr_cfg["use_post_rr"]),
+        mean_includes_current=bool(rr_cfg.get("mean_includes_current", True)),
+        record_norm=str(rr_cfg.get("record_norm", "none")),
+        record_mean_type=str(rr_cfg.get("record_mean_type", "full")),
     )
 
     # AAMI labels for every beat
@@ -215,6 +218,83 @@ def build_template_data(records: list, cfg: dict) -> dict:
                     segs_by_sym[sym].append(seg)  # keep multi-channel
 
     return segs_by_sym
+
+
+def _crop_template_segs(segs_by_sym: dict, nk: int) -> dict:
+    """Centre-crop every template segment to nk samples (axis 0)."""
+    out = {}
+    for sym, segs in segs_by_sym.items():
+        cropped = []
+        for seg in segs:
+            seg = np.asarray(seg)
+            if seg.shape[0] > nk:
+                m0 = (seg.shape[0] - nk) // 2
+                seg = seg[m0:m0 + nk]
+            cropped.append(seg)
+        out[sym] = cropped
+    return out
+
+
+def compute_template_inputs(cfg: dict) -> tuple:
+    """
+    Collect template segments according to cfg["templates"].
+
+    Returns (segs_primary, segs_fallback, sub_classes, nk).
+      templates.source        : ds1_train (default; fallback to all DS1 for
+                                sub-classes with < min_beats) | ds1_all
+                                (paper: "mean of all examples per class in
+                                the training set DS1")
+      templates.match_classes : false (default, all 13 sub-classes) | true
+                                (keep only sub-classes whose AAMI class is a
+                                model output: 11 for 3-class, as paper Table 3)
+    When input.crop_input is false the segments are 64 samples long; the
+    templates are centre-cropped to NK before averaging/L2-normalising.
+    """
+    t_cfg = cfg["templates"]
+    source = t_cfg.get("source", "ds1_train")
+    if source == "ds1_all":
+        segs_primary = build_template_data(DS1_TRAIN + DS1_VAL, cfg)
+        segs_fallback = None
+    else:
+        segs_primary = build_template_data(DS1_TRAIN, cfg)
+        segs_fallback = build_template_data(DS1_TRAIN + DS1_VAL, cfg)   # for fallback
+
+    nk = int(cfg["input"]["nk"])
+    if not bool(cfg["input"].get("crop_input", True)):
+        segs_primary = _crop_template_segs(segs_primary, nk)
+        if segs_fallback is not None:
+            segs_fallback = _crop_template_segs(segs_fallback, nk)
+
+    sub_classes = list(t_cfg["sub_classes"])
+    if bool(t_cfg.get("match_classes", False)) and cfg["task"]["name"] == "multiclass":
+        from .data import AAMI_MAP
+        keep = set(AAMI_CLASSES[:int(cfg["task"]["classes"])])
+        sub_classes = [s_ for s_ in sub_classes if AAMI_MAP.get(s_) in keep]
+    return segs_primary, segs_fallback, sub_classes, nk
+
+
+def build_mf_kernel(cfg: dict) -> np.ndarray:
+    """Compute the (NK, C, F) matched-filter kernel for a fully-resolved cfg."""
+    segs_p, segs_f, sub_cls, nk_ = compute_template_inputs(cfg)
+    tpl = compute_subclass_templates(
+        segments_by_symbol=segs_p, nk=nk_, sub_classes=sub_cls,
+        min_beats=int(cfg["templates"]["min_beats"]),
+        normalize_l2=bool(cfg["templates"]["normalize_l2"]),
+        fallback_segments=segs_f,
+        empty_fallback=str(cfg["templates"].get("empty_fallback", "zero")),
+    )
+    n_ch = {"signal": 1, "derivative": 1, "both": 2}[cfg["input"]["mode"]]
+    return templates_to_kernel(tpl, sub_cls, n_ch)
+
+
+def train_records(cfg: dict) -> list:
+    """data.train_records: ds1_train (default, records < 200) | ds1_all."""
+    which = str(cfg["data"].get("train_records", "ds1_train"))
+    if which == "ds1_all":
+        return DS1_TRAIN + DS1_VAL
+    if which != "ds1_train":
+        raise ValueError(f"Unknown data.train_records {which!r}")
+    return DS1_TRAIN
 
 
 # %%
@@ -377,7 +457,13 @@ def write_results_summary(all_results: list, out: Path, cfg: dict) -> None:
         cfg_str = r.get("config", {})
         mets    = r.get("metrics_test_mean", {})
 
-        pct = lambda k: f"{100*mets.get(k, float('nan')):.2f}" if mets.get(k) is not None else "—"
+        def pct(k):
+            # summarise_seeds() returns '<k>_mean' / '<k>_std'; accept both forms
+            v = mets.get(k, mets.get(k + "_mean"))
+            if v is None:
+                return "—"
+            sd = mets.get(k + "_std")
+            return f"{100*v:.2f}" + (f" ± {100*sd:.2f}" if sd is not None else "")
         pct_std = lambda k: (f"{100*mets.get(k+'_mean', float('nan')):.2f} ± "
                               f"{100*mets.get(k+'_std', 0):.2f}")
 
@@ -451,6 +537,9 @@ def main(argv=None) -> None:
                     help="Run P3: binary raw (dedicated + collapsed P1)")
     ap.add_argument("--grid",          action="store_true",
                     help="Run full paper grid (all Table 4 configurations)")
+    ap.add_argument("--grid-table4",   action="store_true",
+                    help="Run the 9 model variants of the paper's actual Table 4 "
+                         "(Models 1-5 class weight SET, 6-9 NOT SET)")
     ap.add_argument("--ablations",     action="store_true",
                     help="Run ablations (bandpass, all-DS1 templates, z-score, 2-RR)")
     ap.add_argument("--rr-baseline",   action="store_true",
@@ -475,7 +564,11 @@ def main(argv=None) -> None:
     ap.add_argument("--no-deterministic", action="store_true", default=False,
                     help="Skip enable_op_determinism() — faster on GPU, slightly less reproducible")
     ap.add_argument("--filter",           choices=["none", "bandpass"], default=None)
-    ap.add_argument("--results-dir",      default=None)
+    ap.add_argument("--results-dir",      default=None,
+                    help="Directory for run.log, resolved_config.yaml, beat_counts.md, "
+                         "summaries and figures (default: output.results_dir)")
+    ap.add_argument("--cache-dir",        default=None,
+                    help="Directory for per-seed .pkl/.keras caches (default: output.cache_dir)")
     args = ap.parse_args(argv)
 
     cfg = load_config(_resolve(args.config))
@@ -493,7 +586,12 @@ def main(argv=None) -> None:
     if args.mixed_precision: cfg["compute"]["mixed_precision"]   = True
     if args.no_deterministic:cfg["compute"]["deterministic"]     = False
     if args.filter:          cfg["preprocess"]["filter"]         = args.filter
-    if args.results_dir:     cfg["output"]["results_dir"]        = args.results_dir
+    if args.results_dir:
+        cfg["output"]["results_dir"] = args.results_dir
+        # keep every output of this run under --results-dir (figures too);
+        # the model cache is only moved with an explicit --cache-dir.
+        cfg["output"]["figures_dir"] = str(Path(args.results_dir) / "figures")
+    if args.cache_dir:       cfg["output"]["cache_dir"]          = args.cache_dir
 
     out     = _resolve(cfg["output"]["results_dir"])
     fig_dir = _resolve(cfg["output"]["figures_dir"])
@@ -528,13 +626,7 @@ def main(argv=None) -> None:
 
     # ------------------------------------------------------------------ Templates
     log.info("=== Computing matched-filter templates from DS1-train ===")
-    template_segs_tr  = build_template_data(DS1_TRAIN, cfg)
-    template_segs_all = None
-    if cfg["templates"].get("source") == "ds1_train":
-        template_segs_all = build_template_data(DS1_TRAIN + DS1_VAL, cfg)   # for fallback
-
-    sub_classes  = list(cfg["templates"]["sub_classes"])
-    nk           = int(cfg["input"]["nk"])
+    template_segs_tr, template_segs_all, sub_classes, nk = compute_template_inputs(cfg)
     n_channels   = {"signal": 1, "derivative": 1, "both": 2}[cfg["input"]["mode"]]
     normalize_l2 = bool(cfg["templates"]["normalize_l2"])
 
@@ -545,6 +637,7 @@ def main(argv=None) -> None:
         min_beats=int(cfg["templates"]["min_beats"]),
         normalize_l2=normalize_l2,
         fallback_segments=template_segs_all,
+        empty_fallback=str(cfg["templates"].get("empty_fallback", "zero")),
     )
 
     if cfg["output"].get("plot_templates", True):
@@ -575,7 +668,7 @@ def main(argv=None) -> None:
 
     t0 = time.perf_counter()
     if task == "multiclass" or args.p1 or args.grid:
-        ds_tr   = build_dataset(DS1_TRAIN, cfg, "multiclass", classes, binary_def)
+        ds_tr   = build_dataset(train_records(cfg), cfg, "multiclass", classes, binary_def)
         ds_val  = build_dataset(DS1_VAL,   cfg, "multiclass", classes, binary_def)
         ds_test = build_dataset(DS2,       cfg, "multiclass", classes, binary_def)
         log.info("3-class data loaded in %.1f s", time.perf_counter() - t0)
@@ -597,7 +690,7 @@ def main(argv=None) -> None:
             )
         else:
             # Build 3-class data for the RR baseline
-            ds_tr3   = build_dataset(DS1_TRAIN, cfg, "multiclass", 3, binary_def)
+            ds_tr3   = build_dataset(train_records(cfg), cfg, "multiclass", 3, binary_def)
             ds_val3  = build_dataset(DS1_VAL,   cfg, "multiclass", 3, binary_def)
             ds_test3 = build_dataset(DS2,       cfg, "multiclass", 3, binary_def)
             rr_res = xgboost_sanity_check(
@@ -615,7 +708,7 @@ def main(argv=None) -> None:
     all_results = []
     model_p1    = None   # keep for binary collapsed extension
 
-    if args.p1 or not (args.p2 or args.p3 or args.grid or args.ablations):
+    if args.p1 or not (args.p2 or args.p3 or args.grid or args.grid_table4 or args.ablations):
         log.info("=== P1: Model 6 (3-class, derivative, NK=32, mf_trainable) ===")
         # Apply P1 config overrides
         cfg_p1 = dict(cfg)
@@ -690,7 +783,7 @@ def main(argv=None) -> None:
         )
 
     # ------------------------------------------------------------------ Grid
-    if args.grid:
+    if args.grid or args.grid_table4:
         log.info("=== Full paper grid (Table 4 reproduction) ===")
         grid_configs = []
         for inp in ["signal", "derivative", "both"]:
@@ -710,6 +803,24 @@ def main(argv=None) -> None:
                 "classes": cl,
             })
 
+        _grid_ds_cache = {}
+        if args.grid_table4:
+            # Paper Table 4 (Farag 2023), Models 1-9 in order.  DEF = Keras
+            # default (Glorot) init, trainable; TRUE = MF init, trainable;
+            # FALSE = MF init, frozen.  SET = class weights ("balanced").
+            _t4 = [  # (classes, init, nk, input, cw)
+                (3, "default",      64, "derivative", "balanced"),
+                (3, "mf_trainable", 32, "derivative", "balanced"),
+                (3, "mf_frozen",    32, "derivative", "balanced"),
+                (3, "default",      32, "both",       "balanced"),
+                (3, "mf_trainable", 32, "signal",     "balanced"),
+                (3, "mf_trainable", 32, "derivative", "none"),
+                (3, "mf_trainable", 64, "derivative", "none"),
+                (4, "mf_trainable", 32, "derivative", "none"),
+                (5, "mf_trainable", 32, "derivative", "none"),
+            ]
+            grid_configs = [{"input": i_, "nk": n_, "init": in_, "class_weight": c_,
+                             "classes": k_} for (k_, in_, n_, i_, c_) in _t4]
         for gc in grid_configs:
             run_name_g = (f"grid_{gc['input']}_nk{gc['nk']}_{gc['init']}"
                           f"_cw{gc['class_weight']}_c{gc['classes']}")
@@ -719,11 +830,32 @@ def main(argv=None) -> None:
             cfg_g["task"]     = {**cfg["task"],     "init": gc["init"]}
             cfg_g["training"] = {**cfg["training"], "class_weight": gc["class_weight"]}
             n_ch_g = {"signal": 1, "derivative": 1, "both": 2}[gc["input"]]
-            kern_g = templates_to_kernel(templates, sub_classes, n_ch_g)
+            if bool(cfg["templates"].get("recompute_per_variant", False)):
+                # Fidelity fix: templates must come from the same input type
+                # (signal / derivative / both) and class set as the variant.
+                # The legacy behaviour (flag false) reuses the default-mode
+                # (derivative) templates for every grid variant.
+                cfg_gt = {k: dict(v) if isinstance(v, dict) else v for k, v in cfg_g.items()}
+                cfg_gt["task"] = {**cfg_g["task"], "classes": gc["classes"]}
+                kern_g = build_mf_kernel(cfg_gt)
+            else:
+                kern_g = templates_to_kernel(templates, sub_classes, n_ch_g)
 
             # Reload data with correct number of classes
-            if gc["classes"] != 3:
-                ds_tr_g   = build_dataset(DS1_TRAIN, cfg_g, "multiclass",
+            _recomp = bool(cfg["templates"].get("recompute_per_variant", False))
+            _same_inp = (gc["input"] == cfg["input"]["mode"] and gc["nk"] == int(cfg["input"]["nk"]))
+            if _recomp and (gc["classes"] != classes or not _same_inp):
+                # Fidelity fix: rebuild the ECG inputs for this input type /
+                # NK (legacy path reused the default-mode data for every
+                # 3-class variant, so input/NK were never actually varied).
+                _key = (gc["input"], gc["nk"], gc["classes"])
+                if _key not in _grid_ds_cache:
+                    _grid_ds_cache[_key] = tuple(
+                        build_dataset(recs, cfg_g, "multiclass", gc["classes"], binary_def)
+                        for recs in (train_records(cfg), DS1_VAL, DS2))
+                ds_tr_g, ds_val_g, ds_test_g = _grid_ds_cache[_key]
+            elif gc["classes"] != 3:
+                ds_tr_g   = build_dataset(train_records(cfg), cfg_g, "multiclass",
                                            gc["classes"], binary_def)
                 ds_val_g  = build_dataset(DS1_VAL,   cfg_g, "multiclass",
                                            gc["classes"], binary_def)
@@ -762,7 +894,7 @@ def main(argv=None) -> None:
                            "binary_def": b_def, "init": "mf_trainable"}
         cfg_bin["training"] = {**cfg["training"], "class_weight": "none"}
 
-        ds_tr_bin  = build_dataset(DS1_TRAIN, cfg_bin, "binary", classes, b_def)
+        ds_tr_bin  = build_dataset(train_records(cfg), cfg_bin, "binary", classes, b_def)
         ds_val_bin = build_dataset(DS1_VAL,   cfg_bin, "binary", classes, b_def)
         ds_test_bin= build_dataset(DS2,       cfg_bin, "binary", classes, b_def)
 
@@ -803,7 +935,44 @@ def main(argv=None) -> None:
             out / f"{p_name}_metrics_per_seed.csv", index=False
         )
 
-        # Collapsed 3-class -> binary
+        # binary.threshold_strategy == val_f1: per-seed threshold chosen on
+        # DS1-val (never DS2), reported next to t=0.5.
+        if str(cfg["binary"].get("threshold_strategy", "val_f1")) == "val_f1":
+            thr_rows = []
+            for br in bin_results:
+                if "proba_val" not in br:
+                    continue
+                t_opt, f1_val = find_optimal_threshold(
+                    br["proba_val"][:, 1], ds_val_bin["y"],
+                    start=float(cfg["binary"]["threshold_start"]),
+                    stop=float(cfg["binary"]["threshold_stop"]),
+                    step=float(cfg["binary"]["threshold_step"]),
+                )
+                pp = br["proba_test"][:, 1]
+                m_t = binary_metrics(ds_test_bin["y"], (pp >= t_opt).astype(int), pp)
+                m_t = {**m_t, "seed": br["seed"], "threshold": t_opt, "val_f1_arr": f1_val}
+                thr_rows.append(m_t)
+                log.info("%s seed %d (t=%.2f from DS1-val): acc=%.2f%% se=%.2f%% sp=%.2f%% f1=%.2f%%",
+                         p_name, br["seed"], t_opt,
+                         100*m_t.get("accuracy",0), 100*m_t.get("sensitivity",0),
+                         100*m_t.get("specificity",0), 100*m_t.get("f1_arr",0))
+            if thr_rows:
+                pd.DataFrame(thr_rows).to_csv(
+                    out / f"{p_name}_metrics_per_seed_valthreshold.csv", index=False)
+
+        # Collapsed 3-class -> binary.  Without --p1 in this invocation, try
+        # the cached P1 model (P1_seed<first seed>.keras in output.cache_dir).
+        if model_p1 is None:
+            _p1_path = _resolve(cfg["output"]["cache_dir"]) / f"P1_seed{list(cfg['seeds'])[0]}.keras"
+            if _p1_path.exists():
+                try:
+                    from tensorflow import keras as _k
+                    model_p1 = _k.models.load_model(str(_p1_path))
+                    log.info("%s collapsed: loaded cached P1 model %s", p_name, _p1_path)
+                except Exception as exc:
+                    log.warning("could not load cached P1 model %s: %s", _p1_path, exc)
+            else:
+                log.info("%s collapsed: no P1 model (run --p1 or cache %s)", p_name, _p1_path)
         if model_p1 is not None:
             from .train import predict as _predict
             _, proba_test_3c = _predict(model_p1, ds_test["X_ecg"], ds_test["X_rr"])

@@ -13,6 +13,12 @@
 #   ablations  — 7 ablations A1-A6b (3 seeds each)
 #   distill    — export soft labels + ONNX (requires prior training)
 #   evaluate   — print metrics table from saved results
+#   eval_full  — 5-class + 3-class N/S/V DS2 eval + temperature scaling  [RUN_DIR]
+#   fix        — 3-seed GPU training with the balanced DS1 split (S-starvation fix)
+#   export     — teacher soft labels (.npz) + ONNX + TorchScript       [RUN_DIR]
+#
+# Environment: PY=/path/to/python overrides the interpreter; on the lab box
+# the shared $REPO_ROOT/.venv-torch (CUDA torch) is used automatically.
 #
 # This script can be run from any directory inside the fyp repo.
 # =============================================================================
@@ -35,7 +41,11 @@ if [[ ! -d "$PAPER4_DIR" ]]; then
 fi
 
 # ── Resolve Python interpreter ────────────────────────────────────────────────
-if [[ -f "$VENV_DIR/bin/python" ]]; then
+if [[ -n "${PY:-}" ]]; then
+    :
+elif [[ -f "$REPO_ROOT/.venv-torch/bin/python" ]]; then
+    PY="$REPO_ROOT/.venv-torch/bin/python"
+elif [[ -f "$VENV_DIR/bin/python" ]]; then
     PY="$VENV_DIR/bin/python"
 elif command -v python3 &>/dev/null; then
     PY="python3"
@@ -90,7 +100,7 @@ train)
     echo "Note: CPU training is slow (~3-4 h). Use 'gpu' mode for faster training."
     run_py -m src.run_experiment \
         --classes 5 \
-        --seeds 3 \
+        --seeds 0 1 2 \
         --device cpu \
         --results-dir results/cpu_run
     ;;
@@ -109,19 +119,35 @@ gpu)
         echo "GPU: $GPU_NAME"
     fi
 
+    # NOTE: --seeds takes seed VALUES (the old "--seeds 3" trained only seed 3)
     run_py -m src.run_experiment \
         --classes 5 \
-        --seeds 3 \
+        --seeds 0 1 2 \
         --device "$DEVICE" \
         --results-dir results/gpu_run \
         $EXTRA_FLAGS
 
     echo ""
-    echo "--- Exporting distillation soft labels ---"
-    run_py -m src.run_experiment \
-        --distill \
-        --device "$DEVICE" \
-        --results-dir results/gpu_run
+    echo "--- DS2 evaluation (5-class + 3-class) ---"
+    run_py -m src.evaluate_full --results-dir results/gpu_run
+    ;;
+
+# ── fix: balanced DS1 patient split + N/S/V macro-F1 model selection ───────────
+fix)
+    run_py -m src.run_experiment --seeds 0 1 2 --device cuda --mixed-precision \
+        --results-dir results/fix_balsplit \
+        --set data.ds1_split=balanced "training.select_classes=[0,1,2]"
+    run_py -m src.evaluate_full --results-dir results/fix_balsplit
+    ;;
+
+# ── eval_full ────────────────────────────────────────────────────────────────
+eval_full)
+    run_py -m src.evaluate_full --results-dir "${2:-results/gpu_run}"
+    ;;
+
+# ── export: teacher soft labels + ONNX/TorchScript (no distillation) ─────────
+export)
+    run_py -m src.export_teacher --results-dir "${2:-results/gpu_run}" --out-dir results/teacher
     ;;
 
 # ── ablations ────────────────────────────────────────────────────────────────
@@ -138,7 +164,8 @@ ablations)
 
     run_py -m src.run_experiment \
         --ablations \
-        --seeds 3 \
+        --seeds 0 \
+        --ablation-seeds 0 1 2 \
         --device "$DEVICE" \
         --results-dir results/ablations \
         $EXTRA_FLAGS
@@ -146,23 +173,11 @@ ablations)
 
 # ── distill ───────────────────────────────────────────────────────────────────
 distill)
-    echo "--- Distillation export (requires prior training in results/gpu_run) ---"
+    # Teacher EXPORT only (soft labels .npz + ONNX + TorchScript, EMA weights).
+    # The old "run_experiment --distill" path exported non-EMA weights for ONNX.
+    echo "--- Teacher export (requires prior training + eval_full in RUN_DIR) ---"
     RESULTS_DIR="${2:-results/gpu_run}"
-
-    if ! "$PY" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-        DEVICE="cpu"
-    else
-        DEVICE="cuda"
-    fi
-
-    run_py -m src.run_experiment \
-        --distill \
-        --device "$DEVICE" \
-        --results-dir "$RESULTS_DIR"
-
-    echo ""
-    echo "Soft labels saved in $PAPER4_DIR/$RESULTS_DIR/distill/"
-    echo "Transfer to paper3 student directory for knowledge distillation."
+    run_py -m src.export_teacher --results-dir "$RESULTS_DIR" --out-dir results/teacher
     ;;
 
 # ── evaluate ─────────────────────────────────────────────────────────────────
@@ -176,9 +191,10 @@ from src.metrics import print_metrics_table, aggregate_seeds
 
 results_dir = Path('$RESULTS_DIR')
 seed_results = []
-for f in sorted(results_dir.glob('results_seed*.json')):
-    with open(f) as fp:
-        seed_results.append(json.load(fp))
+import pickle
+for f in sorted((results_dir / 'cache').glob('DEFAULT_seed*.pkl')):
+    with open(f, 'rb') as fp:
+        seed_results.append(pickle.load(fp))
 
 if not seed_results:
     print('No results found in', results_dir)
@@ -203,6 +219,9 @@ help|*)
     echo "  ablations  — 7 ablations A1-A6b (3 seeds each; slow)"
     echo "  distill    — export soft labels + ONNX (requires prior training)"
     echo "  evaluate   — print metrics table from saved results"
+    echo "  eval_full  — DS2 5-class + 3-class N/S/V eval, temperature scaling [RUN_DIR]"
+    echo "  fix        — 3-seed training with balanced DS1 split (S fix)"
+    echo "  export     — teacher soft labels .npz + ONNX + TorchScript [RUN_DIR]"
     echo ""
     echo "See HasanML/paper4/README.md and 1DCNN/how_to_run_paper4.txt for details."
     ;;

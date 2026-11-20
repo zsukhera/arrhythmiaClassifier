@@ -139,7 +139,7 @@ def lightgbm_sanity_check(X_tr: np.ndarray, y_tr: np.ndarray,
 
     clf = lgb.LGBMClassifier(
         n_estimators=200, max_depth=6, learning_rate=0.1,
-        num_leaves=31, n_jobs=-1, verbose=-1,
+        num_leaves=31, n_jobs=6, verbose=-1,
         class_weight="balanced",
     )
     clf.fit(X_tr[mask_tr], y_tr[mask_tr])
@@ -161,3 +161,53 @@ def lightgbm_sanity_check(X_tr: np.ndarray, y_tr: np.ndarray,
 
     return {"accuracy": float(acc), "se_S": float(se_s), "se_V": float(se_v),
             "report": report}
+
+
+# %%
+# Extended RR features (2026-11-19, kanformer2).  Additive; the 6 base
+# features above are unchanged.  Motivation (reports/kanformer.md sec. 3):
+# DS2 S beats are mostly RUNS (SVT), where the 10-beat local mean is itself
+# shortened, so pre/local ~ 1.  Normalising by a long, robust, causal
+# reference of the patient's own rhythm keeps runs visible.
+RR_EXT_NAMES = [
+    "pre/local", "post/local", "pre/global", "post/global", "pre/post",
+    "(post-pre)/local",
+    "pre/run_mean", "post/run_mean",          # causal expanding (record) mean
+    "pre/med400", "post/med400",              # causal median of last 400 RR
+    "prev_pre/med400",                        # previous beat premature -> run
+]
+
+
+def _causal_median(x: np.ndarray, window: int) -> np.ndarray:
+    """out[i] = median(x[max(0, i-window+1) : i+1])  (causal)."""
+    n = len(x)
+    out = np.empty(n, dtype=np.float64)
+    if n == 0:
+        return out
+    from numpy.lib.stride_tricks import sliding_window_view
+    head = min(window - 1, n)
+    for i in range(head):
+        out[i] = np.median(x[:i + 1])
+    if n >= window:
+        out[window - 1:] = np.median(sliding_window_view(x, window), axis=1)
+    return out
+
+
+def compute_rr_features_ext(r_samples_all: np.ndarray, fs: float,
+                            local_window: int = 10, global_window: int = 400,
+                            median_window: int = 400) -> np.ndarray:
+    """(n_beats, 11) float32: the 6 base features + 5 long-reference ones
+    (see RR_EXT_NAMES).  Latency is the same as the base set (post-RR = one
+    beat of look-ahead); every reference mean/median is causal."""
+    base = compute_rr_features(r_samples_all, fs, local_window, global_window)
+    pre = compute_rr_intervals(r_samples_all)
+    n = len(pre)
+    post = np.empty(n, dtype=np.float64)
+    post[:-1] = pre[1:]
+    post[-1] = pre[-1]
+    run_mean = np.maximum(np.cumsum(pre) / np.arange(1, n + 1), EPSILON)
+    med = np.maximum(_causal_median(pre, median_window), EPSILON)
+    prev_pre = np.concatenate([[pre[0]], pre[:-1]])
+    ext = np.stack([pre / run_mean, post / run_mean, pre / med, post / med,
+                    prev_pre / med], axis=1)
+    return np.concatenate([base, ext.astype(np.float32)], axis=1).astype(np.float32)

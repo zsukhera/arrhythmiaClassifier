@@ -43,6 +43,7 @@ def compute_subclass_templates(
     min_beats: int = 5,
     normalize_l2: bool = True,
     fallback_segments: Optional[dict] = None,
+    empty_fallback: str = "zero",
 ) -> dict:
     """
     Compute one template (class-average waveform) per MIT-BIH sub-class.
@@ -94,6 +95,27 @@ def compute_subclass_templates(
                 t = t / norm
 
         templates[sym] = t
+
+    # empty_fallback='aami': a sub-class with no beats at all (e.g. 'S', which
+    # has 0 beats in DS1) gets the mean of the other sub-class templates of
+    # the same AAMI class instead of an all-zero (dead) filter.
+    if empty_fallback == "aami":
+        for sym in sub_classes:
+            if np.linalg.norm(templates[sym]) > 1e-9:
+                continue
+            sib = [templates[o] for o in sub_classes
+                   if o != sym and AAMI_MAP.get(o) == AAMI_MAP.get(sym)
+                   and np.linalg.norm(templates[o]) > 1e-9
+                   and np.shape(templates[o]) == np.shape(templates[sym])]
+            if sib:
+                t = np.mean(sib, axis=0)
+                if normalize_l2 and np.linalg.norm(t) > 1e-9:
+                    t = t / np.linalg.norm(t)
+                templates[sym] = t
+                log.info("template '%s': empty -> mean of %d AAMI-%s sibling templates",
+                         sym, len(sib), AAMI_MAP.get(sym))
+    elif empty_fallback != "zero":
+        raise ValueError(f"Unknown empty_fallback {empty_fallback!r}")
 
     return templates
 

@@ -89,7 +89,9 @@ class FocalLoss(nn.Module):
         loss = -alpha_t * (1.0 - pt) ** self.gamma * log_pt
 
         if self.reduction == "mean":
-            return loss.mean()
+            # Weighted mean (same convention as F.cross_entropy(weight=...)),
+            # so FocalLoss(gamma=0) == weighted CE exactly.
+            return loss.sum() / alpha_t.sum().clamp_min(1e-12)
         if self.reduction == "sum":
             return loss.sum()
         return loss
@@ -120,8 +122,26 @@ class LabelSmoothingCE(nn.Module):
 
 
 # %%
-def build_loss(cfg: dict, alpha: torch.Tensor) -> nn.Module:
-    """Build loss function from config."""
+def build_loss(cfg, alpha: torch.Tensor = None, *, class_counts=None,
+               gamma: float = 2.0, weight_mode: str = "sqrt",
+               label_smooth_eps: float = 0.05) -> nn.Module:
+    """
+    Build loss function.
+
+    Two call styles:
+      build_loss(cfg_dict, alpha)                       -- from the YAML config
+      build_loss("focal", class_counts=..., gamma=2.0,  -- standalone
+                 weight_mode="sqrt")
+    """
+    if isinstance(cfg, str):
+        if alpha is None:
+            if class_counts is None:
+                raise ValueError("build_loss(str, ...) needs alpha or class_counts")
+            counts = np.asarray(class_counts)
+            y = np.repeat(np.arange(len(counts)), counts.astype(int))
+            alpha = compute_class_alpha(y, len(counts), mode=weight_mode)
+        cfg = {"training": {"loss": cfg, "focal_gamma": gamma,
+                            "label_smooth_eps": label_smooth_eps}}
     t = cfg["training"]
     loss_name = str(t.get("loss", "focal"))
 

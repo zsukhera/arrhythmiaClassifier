@@ -1,0 +1,107 @@
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+data:
+  data_dir: data/mitdb
+  local_mirrors:
+  - ../../datasets/mitbih/mitdb
+  lead: MLII
+  fs_original: 360
+  fs_target: 128
+  exclude_records:
+  - '102'
+  - '104'
+  - '107'
+  - '217'
+preprocess:
+  segment_samples: 64
+  before_r: 32
+  after_r: 32
+  filter: none
+  bandpass_low_hz: 0.5
+  bandpass_high_hz: 40.0
+  bandpass_order: 4
+  normalization: mean
+input:
+  mode: derivative
+  nk: 32
+rr:
+  local_window: 80
+  global_window: 400
+  use_post_rr: true
+  n_features: 4
+templates:
+  source: ds1_train
+  n_templates: 13
+  sub_classes:
+  - N
+  - L
+  - R
+  - e
+  - j
+  - A
+  - a
+  - J
+  - S
+  - V
+  - E
+  - F
+  - Q
+  min_beats: 5
+  normalize_l2: true
+model:
+  padding: valid
+  activation: relu
+  rr_dense_units:
+  - 16
+  - 16
+  - 16
+  use_bias: true
+training:
+  loss: categorical_crossentropy
+  optimizer: adam
+  lr: 0.001
+  lr_reduce_factor: 0.5
+  lr_reduce_patience: 5
+  lr_min: 1.0e-05
+  batch_size: 512
+  max_epochs: 500
+  early_stop_patience: 20
+  restore_best_weights: true
+  class_weight: none
+task:
+  name: multiclass
+  classes: 3
+  init: mf_trainable
+  binary_def: aami
+binary:
+  threshold_strategy: val_f1
+  threshold_start: 0.01
+  threshold_stop: 0.99
+  threshold_step: 0.01
+export:
+  representative_beats: 500
+  pruning_sparsity: 0.5
+  pruning_begin_step: 0
+  pruning_end_step: 300
+  pruning_frequency: 100
+compute:
+  device: cpu
+  mixed_precision: false
+  deterministic: true
+  cpu_workers: auto
+  tf_intra_threads: 2
+  tf_inter_threads: 2
+output:
+  results_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline
+  cache_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline/cache
+  figures_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline/figures
+  plot_templates: false

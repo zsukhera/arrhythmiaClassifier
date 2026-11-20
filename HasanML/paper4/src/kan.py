@@ -69,7 +69,8 @@ def b_splines(x: torch.Tensor, grid: torch.Tensor, k: int) -> torch.Tensor:
     bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
     # Include right endpoint of the last interval
     at_end = (x[..., 0] == grid[:, -1])
-    bases[..., -1] = bases[..., -1] | at_end
+    # (bases is a float tensor, so use max instead of bitwise-or)
+    bases[..., -1] = torch.maximum(bases[..., -1], at_end.to(x.dtype))
 
     for d in range(1, k + 1):
         # grid slices for the de Boor recursion step d
@@ -147,7 +148,7 @@ class KANLinear(nn.Module):
         )
         # Register as buffer: moves with .to(device) but not a parameter.
         # Expand to (in_features, n_knots) for vectorised basis evaluation.
-        self.register_buffer("grid", g.unsqueeze(0).expand(in_features, -1))
+        self.register_buffer("grid", g.unsqueeze(0).expand(in_features, -1).contiguous())
 
         self._reset_parameters()
 

@@ -1,0 +1,118 @@
+seeds:
+- 0
+data:
+  data_dir: data/mitdb
+  local_mirrors:
+  - ../../datasets/mitbih/mitdb
+  - ../paper3/data/mitdb
+  lead: MLII
+  fs: 360
+  exclude_records:
+  - '102'
+  - '104'
+  - '107'
+  - '217'
+  classes: 5
+preprocess:
+  beat_before_r: 90
+  beat_after_r: 166
+  beat_len: 256
+  context_len: 1080
+  context_half: 540
+  filter: bandpass
+  bandpass_low_hz: 0.5
+  bandpass_high_hz: 40.0
+  bandpass_order: 4
+  normalisation: zscore
+rr:
+  local_window: 10
+  global_window: 400
+  n_features: 6
+model:
+  d_model: 128
+  n_heads: 4
+  n_layers: 3
+  ffn_hidden: 256
+  dropout: 0.1
+  stoch_depth: 0.1
+  cnn_channels:
+  - 32
+  - 64
+  - 128
+  ms_kernels:
+  - 3
+  - 7
+  - 15
+  se_reduction: 8
+  head: kan
+  kan_grid_size: 5
+  kan_spline_order: 3
+  kan_grid_range:
+  - -1.0
+  - 1.0
+  kan_hidden: 64
+  head_dropout: 0.2
+training:
+  loss: focal
+  focal_gamma: 2.0
+  label_smooth_eps: 0.05
+  sampler: balanced
+  s_cap: 0.3
+  v_cap: 0.3
+  f_cap: 0.05
+  q_cap: 0.01
+  batch_size: 256
+  optimizer: adamw
+  lr: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 5
+  max_epochs: 6
+  grad_clip: 1.0
+  ema_decay: 0.999
+  early_stop_patience: 15
+  mixed_precision: true
+augmentation:
+  enabled: true
+  amplitude_range:
+  - 0.8
+  - 1.2
+  noise_snr_db:
+  - 20
+  - 35
+  bw_freq_range:
+  - 0.1
+  - 0.5
+  bw_amp_max: 0.1
+  time_shift: 10
+  stretch_range:
+  - 0.9
+  - 1.1
+  rr_jitter: 0.03
+calibration:
+  enabled: true
+  method: temperature
+  T_init: 1.5
+  T_max_iter: 200
+distillation:
+  temperatures:
+  - 1
+  - 2
+  - 4
+  save_ds2: true
+export:
+  onnx: true
+  torchscript: true
+search:
+  n_trials: 40
+  n_folds: 5
+  objective: macro_f1
+compute:
+  device: cuda
+  mixed_precision: true
+  deterministic: true
+  dataloader_workers: 4
+output:
+  results_dir: results/sanity_gpu
+  cache_dir: results/sanity_gpu/cache
+  figures_dir: results/sanity_gpu/figures
+  teacher_dir: results/sanity_gpu/teacher

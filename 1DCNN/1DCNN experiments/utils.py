@@ -193,5 +193,5 @@ def print_row(label: str, m: dict):
 
 def print_footer():
     print(SEP)
-    print("Target (Farag 2023, Table 4):                  97.8   n/a   85.3   89.7    n/a")
+    print("Paper (Farag23 T4 Model 6, no CW)     98.18   99.10   81.60   95.00   92.170")
     print(SEP)

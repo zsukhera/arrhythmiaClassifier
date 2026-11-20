@@ -1,0 +1,119 @@
+# Replication of Farag (2023): "A Tiny Matched Filter-Based CNN for
+# Inter-Patient ECG Classification and Arrhythmia Detection at the Edge,"
+# Sensors, vol. 23, no. 3, art. 1365, doi: 10.3390/s23031365.
+#
+# Every value marked [assumption] is not specified by the paper; the
+# ASSUMPTION is documented so it can be changed and ablated.
+# See README.md for the full assumption list.
+
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 10 runs per config (paper Sec 5.3)
+
+data:
+  data_dir: data/mitdb                   # relative to HasanML/paper3/
+  local_mirrors:
+    - ../../datasets/mitbih/mitdb        # local copy before trying PhysioNet
+  lead: MLII                             # MLII; record 114 has its leads swapped
+  fs_original: 360                       # MIT-BIH sample rate (Hz)
+  fs_target: 128                         # target sample rate after resampling (Hz)
+  exclude_records: ["102", "104", "107", "217"]  # paced records (de Chazal Table 2)
+
+preprocess:
+  segment_samples: 64         # 0.5 s at 128 Hz; 32 before + 32 after R peak [assumption]
+  before_r: 32                # samples before R peak [assumption: symmetric window]
+  after_r: 32                 # samples after R peak  [assumption]
+  filter: none                # none | bandpass; none = paper-faithful (Sec 3)
+  bandpass_low_hz: 0.5        # only used when filter=bandpass; matches preprocess.py
+  bandpass_high_hz: 40.0
+  bandpass_order: 4
+  normalization: mean         # mean | z-score | none  [assumption: subtract segment mean, Sec 5.2]
+
+input:
+  mode: derivative            # signal | derivative | both; derivative = paper's best (Sec 5.3)
+  nk: 32                      # kernel size; 32 | 64; NK=32 is paper Model 6 (best, Sec 5.2)
+                               # NK=32: use central 32 samples from the 64-sample window
+
+rr:
+  local_window: 80            # beats in local mean (paper Sec 3)
+  global_window: 400          # beats in global mean (paper Sec 3)
+  use_post_rr: true           # post_RR adds one beat of latency; paper accepts this (Sec 3)
+  n_features: 4               # [assumption] pre/local, pre/global, post/local, post/global
+                               # 2-feature ablation: use only local normalisation
+
+templates:
+  source: ds1_train           # ds1_train (default) | ds1_all  [assumption: use train-only to avoid
+                               # leaking val records; "DS1" in paper Sec 5.2 is ambiguous]
+  n_templates: 13             # 13 MIT-BIH sub-classes (paper Sec 4.2, Figure 4) [assumption]
+  sub_classes:                # the 13 sub-classes [assumption: confirmed from paper Figure 4
+    - N                        # and ANSI/AAMI Table 1]
+    - L
+    - R
+    - e
+    - j
+    - A
+    - a
+    - J
+    - S
+    - V
+    - E
+    - F
+    - Q
+  min_beats: 5                # fallback to ds1_all for a sub-class with < 5 beats [assumption]
+  normalize_l2: true          # scale each template to unit L2 norm [assumption: prevents any
+                               # one class dominating GlobalMaxPooling because of amplitude]
+
+model:
+  padding: valid              # [assumption] "valid" => output length = max(input-kernel+1, 1)
+  activation: relu            # relu | tanh  [assumption: paper says "ReLU or Tanh", Sec 4]
+  rr_dense_units: [16, 16, 16]  # [assumption: 3 x Dense(16) for the RR branch; Table 3]
+  use_bias: true              # [assumption]
+
+training:
+  loss: categorical_crossentropy
+  optimizer: adam
+  lr: 1.0e-3                  # paper Sec 5.3
+  lr_reduce_factor: 0.5       # [assumption] ReduceLROnPlateau factor; paper says "adaptive LR"
+  lr_reduce_patience: 5       # [assumption] epochs without improvement before halving LR
+  lr_min: 1.0e-5              # [assumption] minimum LR floor
+  batch_size: 512             # paper Sec 5.3
+  max_epochs: 500             # paper Sec 5.3; "rarely exceeds 100 epochs"
+  early_stop_patience: 20     # [assumption] EarlyStopping patience on val_loss
+  restore_best_weights: true  # [assumption]
+  class_weight: none          # none | balanced; none = paper Model 6 best; balanced = minority
+                               # oversample via sklearn compute_class_weight [assumption: formula]
+
+task:
+  name: multiclass            # multiclass | binary
+  classes: 3                  # 3 | 4 | 5 for multiclass; 3=N/S/V (paper best, drops F and Q)
+  init: mf_trainable          # mf_trainable | mf_frozen | default (Glorot)
+  binary_def: aami            # aami | raw; for --task binary
+                               # aami: Normal=N (N,L,R,e,j); Arrhythmia=S,V,F,Q
+                               # raw:  Normal=MIT-BIH 'N' only; Arrhythmia=everything else
+
+binary:
+  threshold_strategy: val_f1  # val_f1 (optimize arrhythmia F1 on DS1-val) | fixed_0.5
+  threshold_start: 0.01
+  threshold_stop: 0.99
+  threshold_step: 0.01
+
+export:
+  representative_beats: 500   # for full-int8 PTQ calibration; drawn from DS1-train
+  pruning_sparsity: 0.5       # magnitude pruning target; [assumption: paper used QKeras/sparsity]
+  pruning_begin_step: 0
+  pruning_end_step: 300       # [assumption] end step for pruning schedule
+  pruning_frequency: 100      # [assumption] how often to update sparsity
+
+compute:
+  device: auto                # auto | cpu | cuda | gpu
+  mixed_precision: false      # true = float16 compute on GPU (RTX/Ampere+: ~1.5-2x faster)
+                               # [assumption: disabled by default for bit-exact paper replication]
+  deterministic: true         # true = enable_op_determinism (reproducible but ~10% slower on GPU)
+                               # set false with --no-deterministic if driver lacks deterministic kernels
+  cpu_workers: auto           # process pool size (auto = max(1, cpu_count//2))
+  tf_intra_threads: 2         # 0 = TF default
+  tf_inter_threads: 2
+
+output:
+  results_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline
+  cache_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline/cache
+  figures_dir: /home/i230510/Desktop/arrhythmiaClassifier/1DCNN/gap_analysis/rr_baseline/figures
+  plot_templates: false        # plot the 13 MF templates after computation (paper Figure 4)

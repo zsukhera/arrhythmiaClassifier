@@ -1,0 +1,110 @@
+FYP WEEKLY SUMMARY — 11 Nov 2026 to 18 Nov 2026
+Zain Ul Arifeen Sukhera
+=====================================================================
+
+OVERVIEW
+--------
+Main achievements this week:
+  - The Farag 2023 tiny 1D-CNN (paper3) was trained on the university
+    GPU lab. [CORRECTED 11-19: we first claimed it matched/exceeded the
+    paper's sensitivities; that used wrong targets. The paper's Model 6
+    targets are plain acc 98.18, Se N/S/V 99.1/81.6/95.0, PPV_S 82.7.
+    Our P1 (acc 91.6) was well behind on accuracy and precision. The
+    gap was closed on 11-19 with p1_faithful.yaml: acc 97.60.]
+  - The KAN-Former teacher (paper4) code was committed.
+  - The LightGBM pipeline was re-trained (100 Optuna trials per split)
+    and evaluated with the new normalised features.
+
+Training box: university GPU lab (Precision 3680). It ran CPU-only
+because the CUDA drivers are not installed. Python 3.14.4, TF 2.22.0rc0.
+
+
+1. 1D-CNN — Farag 2023 replication (HasanML/paper3/)
+---------------------------------------------------
+Code committed (13 Nov):
+  - paper3 + paper4 source, tests, Colab notebooks
+  - run scripts 1DCNN/run_paper3.sh and run_paper4.sh, how-to-run guides
+
+Bugs found and fixed:
+  - run_experiment.py: DS1 was undefined in the template fallback.
+    It now uses DS1_TRAIN + DS1_VAL.
+  - run_experiment.py: the --class-weight flag was ignored for P1.
+  - train.py: EarlyStopping monitored the unweighted val_loss, which
+    stopped training around epoch 27, before the S class was learned.
+    Added a MacroF1Callback and now stop on val_macro_f1.
+  - train.py: callback ordering. MacroF1Callback must come before
+    EarlyStopping, otherwise the metric is missing from the logs and
+    early stopping never triggers.
+  - requirements.txt: added pytest; tensorflow>=2.22 for Python 3.14.
+
+P1 runs (3-class N/S/V, DS2 test set):
+  Run                                  Acc     Se_S    Se_V
+  No class weights (paper as written)  95.56*  0.00    57.32
+  Balanced weights, DS1-train only     90.98   35.01   86.71
+  (* OvR accuracy)
+
+Sensitivity experiments (1DCNN/1DCNN experiments/), aimed at the Se_S gap:
+  Exp1 threshold calibration (tau=0.31)   Se_S 35 -> 57%   free, no retrain
+  Exp2 ensemble + threshold               same as Exp1
+  Exp3 S-beat augmentation x7             Se_S 18.7%       worse (OOD shift)
+  Exp4 focal loss gamma=2                 Se_S 0.4%        fails at 160:1
+  Exp5 full DS1 (944 vs 149 S beats)      Se_S 83%         best
+  Conclusion: training data is the bottleneck, not the loss or tuning.
+
+Official P1 retrain (full DS1, balanced weights, 10 seeds, 216 s total):
+  Ensemble argmax           Acc 91.03  Se_S 85.29  Se_V 95.14  macF1 75.57
+  Ensemble + tau_S=0.50     Acc 91.61  Se_S 87.10  Se_V 96.52  macF1 77.08
+  Paper Model 6 (corrected 11-19)  Acc 98.18  Se_S 81.6  Se_V 95.0  macF1 92.17
+  -> [CORRECTED] Sensitivities on par, but accuracy and precision were far
+     behind (PPV_S 32 vs 83). The old targets 85.3/89.7/97.8 were wrong:
+     85.3/96.34 belong to Model 1, and 89.7/97.8 aren't in the paper.
+     The tau_S=0.50 step equals argmax; the +1.8 came from ensembling.
+
+Not yet run: P2/P3 binary variants, Table 4 grid, ablations, and the
+TFLite/ESP32 export.
+
+
+2. KAN-Former teacher (HasanML/paper4/)
+--------------------------------------
+  - Implementation committed: multi-scale CNN stem + 3-layer Transformer
+    + B-spline KAN head, focal loss, EMA, temperature scaling, and
+    soft-label export for distillation.
+  - NOT TRAINED YET. There are no checkpoints, logs or metrics on the
+    GPU box or locally. This blocks the knowledge-distillation step.
+
+
+3. LightGBM re-run with normalised features (source/)
+----------------------------------------------------
+  - Retrained on features with per-record amplitude and RR
+    normalisation. The old Optuna checkpoints were deleted first.
+  - 100 Optuna trials per split, 5-fold CV.
+      Random split:  13 Nov 19:21 -> 14 Nov 01:44
+      DS1/DS2 split: 14 Nov 01:45 -> 14 Nov 05:54
+  - Tuning gained only about +0.001 CV F1 over the paper's params.
+  - Evaluated on 18 Nov. The log is in eval_step5_main.log on the
+    GPU box.
+
+  Metric       Random   DS1/DS2 new   DS1/DS2 before   Paper
+  Accuracy     0.996    0.764         0.737            0.989
+  Macro-F1     0.987    0.388         0.313            ~0.937
+  Binary F1    0.992    0.409         0.342            0.928
+  OVR AUC      0.999    0.787         0.769            0.985
+
+  DS1/DS2 per-class F1: N 0.858, L 0.014, R 0.002, V 0.827 (was
+  0.655), A 0.237 (was 0.067).
+
+  Findings:
+  - Normalisation helped V and A.
+  - LBBB/RBBB are still about 0, because of patient-specific morphology.
+  - CV F1 0.987 vs test 0.388: the beat-level CV folds mix beats from
+    the same patients, so Optuna cannot tune for unseen patients.
+
+
+NEXT STEPS
+----------
+  1. Train the KAN-Former, then export its soft labels for distillation.
+  2. Use patient-grouped CV (GroupKFold by record) for LightGBM tuning.
+  3. Run the binary LightGBM and the A1-A4 ablation on the new features.
+  4. Run paper3 P2/P3 and the TFLite/INT8 export for the ESP32.
+  5. Look into installing the CUDA drivers on the GPU box. All training
+     there is currently CPU-only.

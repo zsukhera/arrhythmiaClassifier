@@ -1,0 +1,19 @@
+total 56
+drwxrwxr-x 4 i230510 i230510  4096 Nov 13 14:01 .
+drwxrwxr-x 8 i230510 i230510  4096 Nov 13 14:00 ..
+-rw-rw-r-- 1 i230510 i230510  5762 Nov 13 17:04 P1_metrics_per_seed.csv
+-rw-rw-r-- 1 i230510 i230510   303 Nov 13 16:16 beat_counts.md
+drwxrwxr-x 2 i230510 i230510  4096 Nov 18 13:25 cache
+drwxrwxr-x 2 i230510 i230510  4096 Nov 13 14:01 figures
+-rw-rw-r-- 1 i230510 i230510  2611 Nov 13 13:30 paper_table4.md
+-rw-rw-r-- 1 i230510 i230510  1613 Nov 13 16:16 resolved_config.yaml
+-rw-rw-r-- 1 i230510 i230510  1883 Nov 13 17:04 results_summary.md
+-rw-rw-r-- 1 i230510 i230510 14671 Nov 13 17:04 run.log
+53004abd079536c75c2d76f819ed20fc  HasanML/paper3/results/beat_counts.md
+14e6a65b4b0a1b1aa7be975a4fb7bfae  HasanML/paper3/results/P1_metrics_per_seed.csv
+422265dae55038f4c24f18a4ae89966d  HasanML/paper3/results/paper_table4.md
+0c215e97e3d111329c865f7ee478be1a  HasanML/paper3/results/resolved_config.yaml
+c476b156ba28c1adb1a6fb2f9c0f9494  HasanML/paper3/results/results_summary.md
+c4446038fda02c9b397d8beb288d1690  HasanML/paper3/results/run.log
+f0d2feea7f8077e7cc002a83028f8904  HasanML/paper3/results/figures/confusion_P1.png
+1dcd63fb315a9088dde7a64cdc6c7bff  HasanML/paper3/results/figures/templates.png

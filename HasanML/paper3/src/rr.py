@@ -68,7 +68,10 @@ def _causal_mean(x: np.ndarray, window: int) -> np.ndarray:
 
 def compute_rr_features(r_samples_all: np.ndarray, fs: float,
                         local_window: int = 80, global_window: int = 400,
-                        use_post_rr: bool = True) -> np.ndarray:
+                        use_post_rr: bool = True,
+                        mean_includes_current: bool = True,
+                        record_norm: str = "none",
+                        record_mean_type: str = "full") -> np.ndarray:
     """
     Compute the 4 normalised RR features for every beat in the record.
 
@@ -90,6 +93,19 @@ def compute_rr_features(r_samples_all: np.ndarray, fs: float,
       col 2: post_RR / local_mean
       col 3: post_RR / global_mean
     If use_post_rr is False, returns (n_beats, 2) using only pre_RR.
+
+    Fidelity options (defaults reproduce the original behaviour):
+    mean_includes_current : True (default) = local/global means include the
+                    current pre_RR; False = strictly past intervals only
+                    (paper: "calculated only using the past values").
+    record_norm   : per-patient RR normalisation (C4):
+                    'none' (default) — 4 features as above;
+                    'append' — add pre_RR/rec_mean and post_RR/rec_mean (6 features);
+                    'replace_global' — use rec_mean instead of the 400-beat
+                    global mean (still 4 features, same column order).
+    record_mean_type : 'full' = mean of all RR intervals of the record
+                    (non-causal; needs the whole recording) | 'expanding' =
+                    causal running mean of all past intervals.
     """
     n = len(r_samples_all)
     pre_rr = compute_rr_intervals(r_samples_all)   # samples
@@ -106,6 +122,24 @@ def compute_rr_features(r_samples_all: np.ndarray, fs: float,
     # Causal moving averages of pre_RR (local heart rate context)
     local_mean  = _causal_mean(pre_rr, local_window)   # shape (n,)
     global_mean = _causal_mean(pre_rr, global_window)  # shape (n,)
+    if not mean_includes_current and n >= 2:
+        # shift by one beat: mean of intervals strictly before the current one
+        local_mean  = np.concatenate([[pre_rr[0]], local_mean[:-1]])
+        global_mean = np.concatenate([[pre_rr[0]], global_mean[:-1]])
+
+    rec_mean = None
+    if record_norm != "none":
+        if record_mean_type == "full":
+            rec_mean = np.full(n, float(pre_rr.mean()) if n else 1.0)
+        elif record_mean_type == "expanding":
+            rec_mean = np.cumsum(pre_rr) / np.arange(1, n + 1)
+        else:
+            raise ValueError(f"Unknown record_mean_type {record_mean_type!r}")
+        rec_mean = np.where(rec_mean < 1e-6, 1.0, rec_mean)
+        if record_norm == "replace_global":
+            global_mean = rec_mean
+        elif record_norm != "append":
+            raise ValueError(f"Unknown record_norm {record_norm!r}")
 
     # Avoid division by zero (should not happen with real ECG)
     local_mean  = np.where(local_mean  < 1e-6, 1.0, local_mean)
@@ -118,11 +152,15 @@ def compute_rr_features(r_samples_all: np.ndarray, fs: float,
             post_rr / local_mean,
             post_rr / global_mean,
         ])
+        if record_norm == "append":
+            features = np.column_stack([features, pre_rr / rec_mean, post_rr / rec_mean])
     else:
         features = np.column_stack([
             pre_rr / local_mean,
             pre_rr / global_mean,
         ])
+        if record_norm == "append":
+            features = np.column_stack([features, pre_rr / rec_mean])
 
     return features.astype(np.float32)
 
